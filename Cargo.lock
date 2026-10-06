@@ -5078,7 +5078,6 @@ checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 [[package]]
 name = "ryml"
 version = "0.3.2"
-source = "git+https://github.com/GingerAvalanche/ryml.git?branch=no_std_io2#5d542100bc076e378f42b4183772caa92ca8a53b"
 dependencies = [
  "auto-enum",
  "cxx",
@@ -6096,6 +6095,7 @@ version = "0.17.1"
 dependencies = [
  "anyhow",
  "anyhow_ext",
+ "base64 0.22.1",
  "dashmap",
  "dirs2",
  "fs-err",
@@ -6161,6 +6161,7 @@ dependencies = [
  "serde_with",
  "serde_yaml 0.9.34+deprecated",
  "smartstring",
+ "tempfile",
  "typetag",
  "uk-content",
  "uk-reader",

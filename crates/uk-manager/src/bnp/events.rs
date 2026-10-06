@@ -1,4 +1,4 @@
-use anyhow_ext::Result;
+use anyhow_ext::{Context, Result};
 use fs_err as fs;
 use roead::byml::Byml;
 use uk_content::{
@@ -17,7 +17,9 @@ impl BnpConverter {
             let diff = EventInfo::from_byml(&Byml::from_text(fs::read_to_string(events_path)?)?)?;
             let base =
                 self.get_from_master_sarc("Pack/Bootup.pack//Event/EventInfo.product.sbyml")?;
-            if let Ok(base) = EventInfo::from_binary(base) {
+            let base = EventInfo::from_binary(base)
+                .context("Could not parse event info while reading BNP log")?;
+            {
                 let events = base.merge(&diff);
                 self.inject_into_sarc(
                     "Pack/Bootup.pack//Event/EventInfo.product.sbyml",

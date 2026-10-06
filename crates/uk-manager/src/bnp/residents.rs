@@ -1,4 +1,4 @@
-use anyhow_ext::Result;
+use anyhow_ext::{Context, Result};
 use fs_err as fs;
 use roead::byml::Byml;
 use uk_content::{
@@ -14,14 +14,14 @@ impl BnpConverter {
             log::debug!("Processing resident actors log");
             let diff = Byml::from_text(fs::read_to_string(residents_path)?)?.into_map()?;
             let data = self.get_from_master_sarc("Pack/Bootup.pack//Actor/ResidentActors.byml")?;
-            if let Ok(mut residents) = ResidentActors::from_binary(data) {
-                residents
-                    .0
-                    .extend(diff.into_iter().filter_map(|(name, data)| {
-                        ResidentActorData::try_from(data.as_map().ok()?)
-                            .ok()
-                            .map(|d| (name, d))
-                    }));
+            let mut residents = ResidentActors::from_binary(data)
+                .context("Could not parse resident actors while reading BNP log")?;
+            {
+                for (name, data) in diff {
+                    let actor = ResidentActorData::try_from(data.as_map()?)
+                        .with_context(|| format!("Invalid BNP resident actor {name}"))?;
+                    residents.0.insert(name, actor);
+                }
                 self.inject_into_sarc(
                     "Pack/Bootup.pack//Actor/ResidentActors.byml",
                     residents.into_binary(self.platform.into()),

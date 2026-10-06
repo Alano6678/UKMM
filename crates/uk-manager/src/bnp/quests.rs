@@ -1,4 +1,4 @@
-use anyhow_ext::Result;
+use anyhow_ext::{Context, Result};
 use fs_err as fs;
 use roead::{byml::Byml, yaz0::compress};
 use rustc_hash::FxHashMap;
@@ -13,8 +13,7 @@ impl BnpConverter {
             log::debug!("Processing quests log");
             let mut diff = Byml::from_text(fs::read_to_string(quests_path)?)?.into_map()?;
             let mut quests = Byml::from_binary(
-                self.dump
-                    .get_bytes_from_sarc("Pack/TitleBG.pack//Quest/QuestProduct.sbquestpack", false)?,
+                self.get_from_master_sarc("Pack/TitleBG.pack//Quest/QuestProduct.sbquestpack")?,
             )?
             .into_array()?;
             let quest_hashes: FxHashMap<String, usize> = quests
@@ -29,16 +28,26 @@ impl BnpConverter {
                 .collect();
             if let Some(Byml::Map(mods)) = diff.remove("mod") {
                 for (name, quest) in mods {
-                    let index = quest_hashes.get(&name).copied().unwrap_or(quests.len());
+                    let index = quest_hashes
+                        .get(&name)
+                        .copied()
+                        .with_context(|| format!("BNP modifies missing quest {name}"))?;
                     quests[index] = quest;
                 }
             }
             if let Some(Byml::Array(dels)) = diff.remove("del") {
-                for del in dels.into_iter().rev() {
-                    if let Some(index) = quest_hashes.get(del.as_string()?).copied() {
-                        quests.remove(index);
-                    }
-                }
+                let deleted = dels
+                    .iter()
+                    .map(Byml::as_string)
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                quests.retain(|quest| {
+                    quest
+                        .as_map()
+                        .ok()
+                        .and_then(|q| q.get("Name"))
+                        .and_then(|n| n.as_string().ok())
+                        .is_some_and(|n| !deleted.contains(&n))
+                });
             }
             if let Some(Byml::Array(add)) = diff.remove("add") {
                 quests.extend(add);

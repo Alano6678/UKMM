@@ -5,12 +5,12 @@ use std::{
     ops::Deref,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc,
+        atomic::{AtomicUsize, Ordering},
     },
 };
 
-use anyhow_ext::{bail, Context, Result};
+use anyhow_ext::{Context, Result, bail};
 use botw_utils::hashes::StockHashTable;
 use dashmap::DashMap;
 use fs_err as fs;
@@ -77,10 +77,10 @@ impl std::fmt::Debug for ZipData {
 
 #[self_referencing]
 pub struct ParallelZipReader {
-    data:  ZipData,
+    data: ZipData,
     #[borrows(data)]
     #[covariant]
-    zip:   piz::ZipArchive<'this>,
+    zip: piz::ZipArchive<'this>,
     #[borrows(zip)]
     #[covariant]
     files: HashMap<&'this Path, &'this piz::read::FileMetadata<'this>>,
@@ -169,6 +169,8 @@ pub struct ModReader {
     decompressor: Arc<Mutex<zstd::bulk::Decompressor<'static>>>,
     #[serde(skip_serializing)]
     zip: Arc<Option<ParallelZipReader>>,
+    #[serde(skip)]
+    memory: Option<Arc<crate::pack::MemoryMod>>,
 }
 
 impl std::fmt::Debug for ModReader {
@@ -180,6 +182,7 @@ impl std::fmt::Debug for ModReader {
             .field("manifest", &self.manifest)
             .field("decompressor", &"zstd::bulk::Decompressor<'static>")
             .field("zip", &self.zip)
+            .field("native", &self.memory.is_some())
             .finish()
     }
 }
@@ -212,6 +215,14 @@ impl ResourceLoader for ModReader {
 impl ModReader {
     fn get_file_data(&self, name: impl AsRef<Path>) -> uk_reader::Result<Vec<u8>> {
         fn inner(self_: &ModReader, name: &Path) -> uk_reader::Result<Vec<u8>> {
+            if self_.memory.is_some() {
+                let resource = self_
+                    .get_resources(name)?
+                    .into_iter()
+                    .next()
+                    .context("Native mod missing resource")?;
+                return Ok(minicbor_ser::to_vec(&resource).map_err(|e| anyhow::anyhow!("{e}"))?);
+            }
             let canon = canonicalize(name);
             if let Some(zip) = self_.zip.as_ref() {
                 if let Ok(data) = zip.get_file(canon.as_str()) {
@@ -226,9 +237,9 @@ impl ModReader {
                 let path = Path::new("options").join(&opt.path).join(canon.as_str());
                 if let Some(zip) = self_.zip.as_ref() {
                     if let Ok(data) = zip.get_file(path) {
-                        return Ok(self_
-                            .decompress(data.as_slice())
-                            .with_context(|| jstr!("Failed to decompress file {&canon} from mod"))?);
+                        return Ok(self_.decompress(data.as_slice()).with_context(|| {
+                            jstr!("Failed to decompress file {&canon} from mod")
+                        })?);
                     }
                 } else if let Some(path) = self_.path.join(path).exists_then() {
                     return Ok(fs::read(path)?);
@@ -238,7 +249,8 @@ impl ModReader {
                 "Failed to read file {} (canonical path {}) from mod",
                 name.display(),
                 canon
-            ).into())
+            )
+            .into())
         }
         inner(self, name.as_ref())
     }
@@ -254,10 +266,12 @@ impl ModReader {
 
     fn open_inner(path: &Path, options: Vec<ModOption>, peek: bool) -> Result<Self> {
         let path = path.to_path_buf();
-        let result = if path.is_file() {
+        let result = if crate::native::is_bnp(&path) {
+            crate::native::open_bnp(&path, options)
+        } else if path.is_file() {
             match peek {
                 true => ModReader::open_zipped_peek(path, options),
-                false => ModReader::open_zipped(path, options)
+                false => ModReader::open_zipped(path, options),
             }
         } else {
             ModReader::open_unzipped(path, options)
@@ -308,6 +322,7 @@ impl ModReader {
             meta,
             manifest,
             zip: Arc::new(None),
+            memory: None,
         })
     }
 
@@ -370,6 +385,7 @@ impl ModReader {
             meta,
             manifest,
             zip: Arc::new(Some(zip)),
+            memory: None,
         })
     }
 
@@ -387,7 +403,126 @@ impl ModReader {
         &self.manifest
     }
 
+    pub fn from_memory(
+        path: PathBuf,
+        memory: Arc<crate::pack::MemoryMod>,
+        options: Vec<ModOption>,
+    ) -> Result<Self> {
+        Ok(Self {
+            manifest: memory.manifest(&options)?,
+            meta: memory.meta.clone(),
+            path,
+            options,
+            decompressor: init_decompressor(),
+            zip: Arc::new(None),
+            memory: Some(memory),
+        })
+    }
+
+    pub fn rstb_overrides(&self) -> uk_content::util::HashMap<String, u32> {
+        let mut overrides: uk_content::util::HashMap<String, u32> = Default::default();
+        if let Some(memory) = &self.memory {
+            overrides = memory
+                .rstb_layers
+                .get(Path::new(""))
+                .cloned()
+                .unwrap_or_default();
+            for option in &self.options {
+                if let Some(layer) = memory
+                    .rstb_layers
+                    .get(&Path::new("options").join(&option.path))
+                {
+                    overrides.extend(layer.clone());
+                }
+            }
+        }
+        overrides
+    }
+
+    pub fn base_priority(&self) -> bool {
+        self.memory.as_ref().is_some_and(|m| m.base_priority)
+    }
+
+    pub fn dependencies(&self) -> &[(String, String)] {
+        self.memory
+            .as_ref()
+            .map(|m| m.dependencies.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// Both archive formats supply the same typed resources to the merge engine.
+    pub fn contains_resource(&self, name: &Path) -> bool {
+        let canon = canonicalize(name);
+        let contains = |canon: &str| {
+            let paths = std::iter::once(PathBuf::from(canon)).chain(
+                self.options
+                    .iter()
+                    .map(|o| Path::new("options").join(&o.path).join(canon)),
+            );
+            paths.into_iter().any(|path| {
+                if let Some(memory) = &self.memory {
+                    memory.resources.contains_key(&path)
+                } else if let Some(zip) = self.zip.as_ref() {
+                    zip.borrow_files().contains_key(path.as_path())
+                } else {
+                    self.path.join(path).is_file()
+                }
+            })
+        };
+        contains(&canon)
+            || (!canon.starts_with("Aoc/0010/") && contains(&format!("Aoc/0010/{canon}")))
+    }
+
+    pub fn get_resources(&self, name: &Path) -> Result<Vec<ResourceData>> {
+        if let Some(memory) = &self.memory {
+            let canon = canonicalize(name);
+            let mut versions = Vec::new();
+            let mut collect = |canon: &str| {
+                if let Some(resource) = memory.resources.get(Path::new(canon)) {
+                    versions.push(resource.clone());
+                }
+                for option in &self.options {
+                    let path = Path::new("options").join(&option.path).join(canon);
+                    if let Some(resource) = memory.resources.get(&path) {
+                        versions.push(resource.clone());
+                    }
+                }
+            };
+            collect(&canon);
+            if !canon.starts_with("Aoc/0010/") {
+                collect(&format!("Aoc/0010/{canon}"));
+            }
+            if versions.is_empty() {
+                bail!(
+                    "Native mod {} has no resource {}",
+                    self.meta.name,
+                    name.display()
+                );
+            }
+            return Ok(versions);
+        }
+        self.get_versions(name)?
+            .into_iter()
+            .map(|data| {
+                minicbor_ser::from_slice(&data).with_context(|| {
+                    format!(
+                        "Failed to deserialize {} from mod {}",
+                        name.display(),
+                        self.meta.name
+                    )
+                })
+            })
+            .collect()
+    }
+
     pub fn get_versions(&self, name: &Path) -> Result<Vec<Vec<u8>>> {
+        if self.memory.is_some() {
+            return self
+                .get_resources(name)?
+                .iter()
+                .map(|r| minicbor_ser::to_vec(r).map_err(|e| anyhow::anyhow!("{e}")))
+                .collect();
+        }
         let canon = canonicalize(name);
         let mut versions = Vec::with_capacity(1);
         if let Some(zip) = self.zip.as_ref() {
@@ -435,14 +570,14 @@ static RSTB_EXCLUDE_NAMES: &[&str] = &["ActorInfo.product.byml"];
 
 // #[derive(Debug)]
 pub struct ModUnpacker {
-    dump:     Arc<ResourceReader>,
+    dump: Arc<ResourceReader>,
     manifest: Option<Manifest>,
-    mods:     Vec<ModReader>,
-    endian:   Endian,
-    lang:     Language,
-    rstb:     DashMap<String, Option<u32>>,
-    hashes:   StockHashTable,
-    out_dir:  PathBuf,
+    mods: Vec<ModReader>,
+    endian: Endian,
+    lang: Language,
+    rstb: DashMap<String, Option<u32>>,
+    hashes: StockHashTable,
+    out_dir: PathBuf,
 }
 
 impl ModUnpacker {
@@ -474,6 +609,27 @@ impl ModUnpacker {
     }
 
     pub fn unpack(self) -> Result<DashMap<String, Option<u32>>> {
+        for mod_ in &self.mods {
+            for (name, required) in mod_.dependencies() {
+                let dependency = self
+                    .mods
+                    .iter()
+                    .find(|m| &m.meta.name == name)
+                    .with_context(|| {
+                        format!(
+                            "BNP {} requires enabled mod {name} {required}",
+                            mod_.meta.name
+                        )
+                    })?;
+                let installed =
+                    Version::parse(&dependency.meta.version).map_err(|e| anyhow::anyhow!("{e}"))?;
+                let required_version =
+                    Version::parse(required).map_err(|e| anyhow::anyhow!("{e}"))?;
+                if installed < required_version {
+                    bail!("BNP {} requires {name} {required} or later", mod_.meta.name);
+                }
+            }
+        }
         if !self.out_dir.exists() {
             fs::create_dir_all(&self.out_dir)?;
         }
@@ -549,6 +705,18 @@ impl ModUnpacker {
             log::trace!("CLEARPROGRESS");
             Ok(())
         })?;
+        // Preserve BNP removals and declared memory floors after estimating the
+        // final resources. A declared size must not reduce an automatic estimate.
+        for mod_ in &self.mods {
+            for (canon, size) in mod_.rstb_overrides() {
+                if size == 0 {
+                    self.rstb.insert(canon, None);
+                } else {
+                    let mut value = self.rstb.entry(canon).or_insert(Some(size));
+                    *value = Some(value.unwrap_or_default().max(size));
+                }
+            }
+        }
         Ok(self.rstb)
     }
 
@@ -570,10 +738,11 @@ impl ModUnpacker {
             });
             for mod_ in self.mods.iter() {
                 for lang in langs.iter() {
-                    if let Ok(packs) = mod_.get_versions(lang.message_path().as_str().as_ref()) {
+                    if mod_.contains_resource(lang.message_path().as_str().as_ref()) {
+                        let packs = mod_.get_resources(lang.message_path().as_str().as_ref())?;
                         for pack in packs {
                             let Some(MergeableResource::MessagePack(version)) =
-                                minicbor_ser::from_slice::<ResourceData>(&pack)?.take_mergeable()
+                                pack.take_mergeable()
                             else {
                                 bail!("Broken mod language pack at {}", lang);
                             };
@@ -660,34 +829,14 @@ impl ModUnpacker {
                 dump_error.push(e.into());
             }
         }
-        for (data, mod_) in self
-            .mods
-            .iter()
-            .filter_map(|mod_| {
-                mod_.get_versions(filepath.as_ref())
-                    .ok()
-                    .map(|d| d.into_iter().map(|d| (d, &mod_.meta.name)))
-            })
-            .flatten()
-        {
-            let res = minicbor_ser::from_slice(&data);
-            match res {
-                Ok(res) => versions.push_back(Arc::new(res)),
-                Err(e) => {
-                    let msg = format!("{}", e);
-                    if msg.contains("unknown variant") {
-                        bail!(
-                            "Error deserializing resource {canon} from mod {mod_}. This is \
-                             probably because this mod was built with an old, incompatible beta \
-                             of UKMM."
-                        );
-                    } else {
-                        bail!(
-                            "Error deserializing resource {canon} from mod {mod_}. Error: {e}"
-                        );
-                    }
-                }
+        for mod_ in &self.mods {
+            if !mod_.contains_resource(filepath.as_ref()) {
+                continue;
             }
+            let resources = mod_
+                .get_resources(filepath.as_ref())
+                .with_context(|| format!("Failed to read {canon} from mod {}", mod_.meta.name))?;
+            versions.extend(resources.into_iter().map(Arc::new));
         }
         let base_version = versions
             .pop_front()
@@ -716,7 +865,8 @@ impl ModUnpacker {
                 }
                 match Arc::try_unwrap(res) {
                     Ok(res) => res.take_binary().context("No binary resource?")?,
-                    Err(res) => res.as_binary()
+                    Err(res) => res
+                        .as_binary()
                         .map(|b| b.to_vec())
                         .context("No binary resource?")?,
                 }

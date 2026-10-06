@@ -7,20 +7,20 @@ use std::{
 };
 
 use anyhow_ext::{Context, Result};
-use dashmap::{mapref::one::MappedRef, DashMap};
+use dashmap::{DashMap, mapref::one::MappedRef};
 use fs_err as fs;
 use lenient_semver::Version;
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use sanitise_file_name as sfn;
 use serde::{Deserialize, Serialize};
-use serde_with::{serde_as, DisplayFromStr};
+use serde_with::{DisplayFromStr, serde_as};
 use smartstring::alias::String;
 use uk_content::platform_prefixes;
-use uk_mod::{pack::ModPacker, unpack::ModReader, Manifest, Meta, ModOption};
+use uk_mod::{Manifest, Meta, ModOption, pack::ModPacker, unpack::ModReader};
 
 use crate::{
     settings::Settings,
-    util::{self, extract_7z, HashMap},
+    util::{self, HashMap, extract_7z},
 };
 
 type ManifestCache = LazyLock<RwLock<HashMap<(usize, Vec<PathBuf>), Result<Arc<Manifest>>>>>;
@@ -78,6 +78,10 @@ impl Mod {
     }
 
     pub fn manifest_with_options(&self, options: impl AsRef<[ModOption]>) -> Result<Arc<Manifest>> {
+        if uk_mod::native::is_bnp(&self.path) {
+            // BNP resource paths depend on the current dump and language.
+            return ModReader::open(&self.path, options.as_ref()).map(|r| Arc::new(r.manifest));
+        }
         static MANIFEST_CACHE: ManifestCache = LazyLock::new(|| RwLock::new(HashMap::default()));
         match MANIFEST_CACHE
             .write()
@@ -185,45 +189,40 @@ impl Profile {
     pub fn iter(self_: MappedRef<'_, String, Profile, Profile>) -> ModIterator<'_> {
         ModIterator {
             profile: self_,
-            index:   0,
+            index: 0,
         }
     }
 
     pub fn validate(&mut self, all_mods: &HashMap<String, Mod>) -> () {
         let mut mods = self.mods.write();
         let mut mods_by_invalid_hash = HashMap::<usize, Mod>::default();
-        mods.retain(|h, m| {
-            match all_mods.get(&m.meta.name) {
-                None => {
+        mods.retain(|h, m| match all_mods.get(&m.meta.name) {
+            None => {
+                log::warn!(
+                    "{} not found at {}, removing from mod list...",
+                    m.meta.name,
+                    m.path.display()
+                );
+                false
+            }
+            Some(m_) => {
+                if m.path != m_.path {
                     log::warn!(
-                        "{} not found at {}, removing from mod list...",
+                        "{} not found at {}, loading from {} instead...",
                         m.meta.name,
-                        m.path.display()
+                        m.path.display(),
+                        m_.path.display()
                     );
+                    m.path = m_.path.clone();
+                }
+                if *h != m_.hash {
+                    log::info!("{} has a hash mismatch. Reassigning hash...", m.meta.name);
+                    m.hash = m_.hash;
+                    mods_by_invalid_hash.insert(*h, m.clone());
                     false
-                },
-                Some(m_) => {
-                    if m.path != m_.path {
-                        log::warn!(
-                            "{} not found at {}, loading from {} instead...",
-                            m.meta.name,
-                            m.path.display(),
-                            m_.path.display()
-                        );
-                        m.path = m_.path.clone();
-                    }
-                    if *h != m_.hash {
-                        log::info!(
-                            "{} has a hash mismatch. Reassigning hash...",
-                            m.meta.name
-                        );
-                        m.hash = m_.hash;
-                        mods_by_invalid_hash.insert(*h, m.clone());
-                        false
-                    } else {
-                        true
-                    }
-                },
+                } else {
+                    true
+                }
             }
         });
         for m in mods_by_invalid_hash.values() {
@@ -249,7 +248,8 @@ impl Profile {
             }
         }
         load_order.retain(|k| mods.contains_key(k));
-        let keys_missing_from_order = mods.keys()
+        let keys_missing_from_order = mods
+            .keys()
             .filter(|&k| !load_order.contains(k))
             .collect::<Vec<_>>();
         load_order.extend(keys_missing_from_order);
@@ -258,7 +258,7 @@ impl Profile {
 
 pub struct ModIterator<'a> {
     profile: MappedRef<'a, String, Profile, Profile>,
-    index:   usize,
+    index: usize,
 }
 
 impl<'a> Iterator for ModIterator<'a> {
@@ -313,17 +313,17 @@ impl Manager {
             name.clone(),
             serde_yaml::from_str(
                 &fs_err::read_to_string(
-                        self.settings
+                    self.settings
                         .upgrade()
                         .expect("Settings is GONE!")
                         .read()
                         .profiles_dir()
                         .join(name.to_string())
-                        .join("profile.yml")
-                    )
-                    .expect("Lost profile we just created?")
+                        .join("profile.yml"),
+                )
+                .expect("Lost profile we just created?"),
             )
-            .expect("Copied profile contains errors?")
+            .expect("Copied profile contains errors?"),
         );
     }
 
@@ -346,12 +346,27 @@ impl Manager {
 
     pub fn init(settings: &Arc<RwLock<Settings>>) -> Result<Self> {
         log::info!("Initializing mod manager");
-        let all_mods = glob::glob(
-            &settings.read().mods_dir().join("*.zip").to_string_lossy()
-        )?.map(|p| {
-            let mod_ = Mod::from_reader(ModReader::open(p?, vec![])?);
-            Ok((mod_.meta.name.clone(), mod_))
-        }).collect::<Result<HashMap<String, Mod>>>()?;
+        crate::bnp::register_native_reader(settings);
+        let mods_dir = settings.read().mods_dir();
+        let mut all_mods = HashMap::<String, Mod>::default();
+        for extension in ["zip", "bnp"] {
+            for path in glob::glob(&mods_dir.join(format!("*.{extension}")).to_string_lossy())? {
+                let mod_ = Mod::from_reader(ModReader::open(path?, vec![])?);
+                let replace = all_mods
+                    .get(&mod_.meta.name)
+                    .map(|old| -> Result<bool> {
+                        Ok(Version::parse(&mod_.meta.version)
+                            .map_err(|e| anyhow::anyhow!("{e}"))?
+                            >= Version::parse(&old.meta.version)
+                                .map_err(|e| anyhow::anyhow!("{e}"))?)
+                    })
+                    .transpose()?
+                    .unwrap_or(true);
+                if replace {
+                    all_mods.insert(mod_.meta.name.clone(), mod_);
+                }
+            }
+        }
         let current_profile = settings
             .read()
             .platform_config()
@@ -366,21 +381,25 @@ impl Manager {
             .map(|profile| {
                 let profile_path = path.join(profile.as_str()).join("profile.yml");
                 fs::read_to_string(&profile_path)
-                    .with_context(|| format!(
-                        "Failed to read profile data from {}",
-                        profile_path.to_string_lossy()
-                    ))
-                    .and_then(|t|
+                    .with_context(|| {
+                        format!(
+                            "Failed to read profile data from {}",
+                            profile_path.to_string_lossy()
+                        )
+                    })
+                    .and_then(|t| {
                         serde_yaml::from_str::<Profile>(&t)
-                            .with_context(|| format!(
-                                "Failed to parse profile data from {}",
-                                profile_path.to_string_lossy()
-                            ))
+                            .with_context(|| {
+                                format!(
+                                    "Failed to parse profile data from {}",
+                                    profile_path.to_string_lossy()
+                                )
+                            })
                             .and_then(|mut p| {
                                 p.validate(&all_mods);
                                 Ok(p)
                             })
-                    )
+                    })
                     .map(|v| (profile, v))
             })
             .collect::<Result<_>>()?;
@@ -420,15 +439,15 @@ impl Manager {
         ref_manifest: &'m Manifest,
     ) -> impl Iterator<Item = Mod> + 'm {
         let ref_edits_text = !ref_manifest.languages().is_empty();
-        self.mods().filter(move |mod_| {
-            match mod_.manifest() {
-                Ok(manifest) => {
-                    !ref_manifest.content_files.is_disjoint(&manifest.content_files)
+        self.mods().filter(move |mod_| match mod_.manifest() {
+            Ok(manifest) => {
+                !ref_manifest
+                    .content_files
+                    .is_disjoint(&manifest.content_files)
                     || !ref_manifest.aoc_files.is_disjoint(&manifest.aoc_files)
                     || (ref_edits_text && !manifest.languages().is_empty())
-                }
-                Err(_) => false,
             }
+            Err(_) => false,
         })
     }
 
@@ -436,8 +455,28 @@ impl Manager {
     /// mod at the provided path has already been validated.
     pub fn add(&self, mod_path: &Path, profile: Option<&String>) -> Result<Mod> {
         let mut old_version = None;
-        let mod_name = {
+        let (mod_name, base_priority) = {
             let peeker = ModReader::open_peek(mod_path, vec![])?;
+            for (name, required) in peeker.dependencies() {
+                let dependency = Profile::iter(self.get_profile(profile))
+                    .find(|m| &m.meta.name == name)
+                    .with_context(|| {
+                        format!(
+                            "BNP {} requires installed mod {name} {required}",
+                            peeker.meta.name
+                        )
+                    })?;
+                let installed =
+                    Version::parse(&dependency.meta.version).map_err(|e| anyhow::anyhow!("{e}"))?;
+                let required_version =
+                    Version::parse(required).map_err(|e| anyhow::anyhow!("{e}"))?;
+                if installed < required_version {
+                    anyhow_ext::bail!(
+                        "BNP {} requires {name} {required} or later",
+                        peeker.meta.name
+                    );
+                }
+            }
             let name = peeker.meta.name.as_str();
             if let Some(mod_) =
                 Profile::iter(self.get_profile(profile)).find(|m| m.meta.name == name)
@@ -453,7 +492,8 @@ impl Manager {
                     anyhow_ext::bail!("Mod \"{}\" already installed", peeker.meta.name);
                 }
             }
-            peeker.meta.name
+            let base_priority = peeker.base_priority();
+            (peeker.meta.name, base_priority)
         };
         let san_opts: sfn::Options<Option<char>> = sfn::Options {
             url_safe: true,
@@ -467,7 +507,14 @@ impl Manager {
             .expect("Settings is GONE!")
             .read()
             .mods_dir()
-            .join(sanitized + ".zip");
+            .join(
+                sanitized
+                    + if uk_mod::native::is_bnp(mod_path) {
+                        ".bnp"
+                    } else {
+                        ".zip"
+                    },
+            );
         if stored_path.exists() && old_version.is_none() {
             log::debug!("Mod already stored, no need to store it");
         } else {
@@ -483,7 +530,11 @@ impl Manager {
         let mut mod_ = Mod::from_reader(reader);
         mod_.enabled = true;
         let profile_data = self.get_profile(profile);
-        profile_data.load_order_mut().push(mod_.hash);
+        if base_priority {
+            profile_data.load_order_mut().insert(0, mod_.hash);
+        } else {
+            profile_data.load_order_mut().push(mod_.hash);
+        }
         profile_data.mods_mut().insert(mod_.hash, mod_.clone());
         if let Some(old_mod) = old_version {
             profile_data.load_order_mut().retain(|h| *h != old_mod.hash);
@@ -621,7 +672,8 @@ pub fn convert_gfx(
                 .into_iter()
                 .filter_map(Result::ok)
                 .find_map(|f| {
-                    [Some("rules.txt"), Some("info.json")].contains(&f.file_name().to_str())
+                    [Some("rules.txt"), Some("info.json")]
+                        .contains(&f.file_name().to_str())
                         .then(|| f.parent_path().into())
                 })
         };
@@ -635,7 +687,8 @@ pub fn convert_gfx(
                     (f.path().join(content).exists() || f.path().join(dlc).exists())
                         .then(|| f.path())
                         .or_else(|| {
-                            [Some(content), Some(dlc)].contains(&f.file_name().to_str())
+                            [Some(content), Some(dlc)]
+                                .contains(&f.file_name().to_str())
                                 .then(|| f.parent_path().into())
                         })
                 })
@@ -670,11 +723,14 @@ pub fn convert_gfx(
             let mut archive = unrar::Archive::new(path)
                 .open_for_processing()
                 .context("Failed to open RAR for extraction")?;
-            while let Some(header) = archive.read_header()
-                .context("Failed to read header")? {
+            while let Some(header) = archive.read_header().context("Failed to read header")? {
                 archive = if header.entry().is_file() {
-                    log::info!("Extracting {}...", header.entry().filename.to_string_lossy());
-                    header.extract_with_base::<&Path>(tmpdir.as_ref())
+                    log::info!(
+                        "Extracting {}...",
+                        header.entry().filename.to_string_lossy()
+                    );
+                    header
+                        .extract_with_base::<&Path>(tmpdir.as_ref())
                         .context("Failed to extract file")?
                 } else {
                     header.skip().context("Failed to skip folder")?
@@ -701,11 +757,16 @@ pub fn convert_gfx(
     let temp = util::get_temp_folder();
     log::debug!("Temp folder: {}", temp.display());
     log::info!("Attempting to convert mod...");
-    let packer = ModPacker::new(path, &*temp, meta, vec![
-        core.settings()
-            .dump()
-            .context("No dump available for current platform")?,
-    ])?;
+    let packer = ModPacker::new(
+        path,
+        &*temp,
+        meta,
+        vec![
+            core.settings()
+                .dump()
+                .context("No dump available for current platform")?,
+        ],
+    )?;
     let result_path = packer.pack()?;
     log::info!("Conversion complete");
     Ok(result_path)

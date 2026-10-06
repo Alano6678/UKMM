@@ -31,6 +31,7 @@ impl ModInfo<'_> {
     #[allow(deprecated)]
     pub fn preview(&self) -> Option<Arc<RetainedImage>> {
         fn load_preview(mod_: &Mod) -> Result<Option<Arc<RetainedImage>>> {
+            if uk_mod::native::is_bnp(&mod_.path) { return Ok(None); }
             let mut zip = zip::ZipArchive::new(BufReader::new(std::fs::File::open(&mod_.path)?))?;
             for ext in ["jpg", "jpeg", "png", "svg"] {
                 if let Ok(mut file) = zip.by_name(&format!("thumb.{}", ext)) {

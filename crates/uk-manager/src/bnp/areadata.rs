@@ -27,7 +27,9 @@ impl BnpConverter {
                     .map(AreaData)?;
             let areadata =
                 self.get_from_master_sarc("Pack/Bootup.pack//Ecosystem/AreaData.sbyml")?;
-            if let Ok(data) = AreaData::from_binary(areadata) {
+            let data = AreaData::from_binary(areadata)
+                .context("Could not parse area data while reading BNP log")?;
+            {
                 self.inject_into_sarc(
                     "Pack/Bootup.pack//Ecosystem/AreaData.sbyml",
                     data.merge(&diff).into_binary(self.platform.into()),

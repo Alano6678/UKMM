@@ -5,6 +5,7 @@ use std::{
 
 use anyhow::anyhow;
 use anyhow_ext::{Context, Result};
+use base64::Engine;
 use dashmap::{DashMap, DashSet};
 use fs_err as fs;
 use rayon::prelude::*;
@@ -15,11 +16,17 @@ use roead::{
 };
 use rustc_hash::FxHashMap;
 use uk_content::{constants::Language, resource::ResourceData};
-use uk_mod::pack::ModPacker;
+use uk_mod::{
+    pack::{MemoryMod, ModPacker},
+    unpack::ModReader,
+};
 use uk_reader::ResourceReader;
 use uk_util::PathExt;
 
-use crate::{settings::Platform, util::extract_7z};
+use crate::{
+    settings::{Platform, Settings},
+    util::extract_7z,
+};
 mod actorinfo;
 mod areadata;
 mod aslist;
@@ -39,6 +46,18 @@ mod shops;
 mod texts;
 
 type AampDiffMap = FxHashMap<String, AampDiffEntry>;
+
+fn validate_bnp_relative_path(path: &str) -> Result<()> {
+    let normalized = path.replace('\\', "/");
+    if normalized.is_empty()
+        || normalized.starts_with('/')
+        || normalized.contains(':')
+        || normalized.split('/').any(|part| part == "..")
+    {
+        anyhow_ext::bail!("BNP contains an invalid relative path: {path}");
+    }
+    Ok(())
+}
 
 pub enum AampDiffEntry {
     Sarc(AampDiffMap),
@@ -65,6 +84,9 @@ pub fn parse_aamp_diff(header_name: &str, pio: &ParameterIO) -> Result<AampDiffM
             FxHashMap::default(),
             |mut acc, file| -> Result<FxHashMap<String, AampDiffEntry>> {
                 let parts = file.split("//").collect::<Vec<_>>();
+                for part in &parts {
+                    validate_bnp_relative_path(part)?;
+                }
                 if parts.is_empty() {
                     anyhow_ext::bail!("Why are there no diff path parts?");
                 }
@@ -159,19 +181,19 @@ impl BnpConverter {
     }
 
     fn get_master_aoc_bytes(&self, path: &str) -> Result<Vec<u8>> {
-        let path: PathBuf = format!("Aoc/0010/{path}").into();
+        let resource_path: PathBuf = format!("Aoc/0010/{path}").into();
         if self.current_root == self.path {
-            Ok(self.dump.get_aoc_bytes_uncached(path)?)
+            Ok(self.dump.get_aoc_bytes_uncached(resource_path)?)
         } else {
-            let root_path = self.path.join(self.aoc).join(&path);
+            let root_path = self.path.join(self.aoc).join(path);
             if root_path.exists() {
                 let data = self
                     .opt_master_cache
-                    .entry(path)
+                    .entry(resource_path)
                     .or_try_insert_with(|| -> Result<Vec<u8>> { Ok(fs::read(root_path)?) })?;
                 Ok(data.to_vec())
             } else {
-                Ok(self.dump.get_aoc_bytes_uncached(path)?)
+                Ok(self.dump.get_aoc_bytes_uncached(resource_path)?)
             }
         }
     }
@@ -373,6 +395,41 @@ impl BnpConverter {
     }
 
     fn convert_root(&self) -> Result<()> {
+        let logs = self.current_root.join("logs");
+        if logs.is_dir() {
+            const SUPPORTED: &[&str] = &[
+                "packs.json",
+                "actorinfo.yml",
+                "aslist.aamp",
+                "areadata.yml",
+                "deepmerge.aamp",
+                "drops.json",
+                "dstatic.yml",
+                "eventinfo.yml",
+                "gamedata.yml",
+                "mainstatic.yml",
+                "map.yml",
+                "quests.yml",
+                "residents.yml",
+                "savedata.yml",
+                "shop.aamp",
+                "effects.yml",
+                "rstb.json",
+                "texts.json",
+            ];
+            for entry in fs::read_dir(&logs)? {
+                let entry = entry?;
+                if entry.file_type()?.is_file() {
+                    let name = entry.file_name();
+                    if !SUPPORTED.contains(&name.to_string_lossy().as_ref()) {
+                        anyhow_ext::bail!(
+                            "Unsupported BNP log {}; refusing to discard its changes",
+                            entry.path().display()
+                        );
+                    }
+                }
+            }
+        }
         let packs_path = self.current_root.join("logs/packs.json");
         if packs_path.exists() {
             let is_root = self
@@ -386,6 +443,9 @@ impl BnpConverter {
                 &fs::read_to_string(packs_path).context("Failed to read packs.json")?,
             )
             .context("Failed to parse packs.json")?;
+            for path in log.values() {
+                validate_bnp_relative_path(path)?;
+            }
             for pack in log.into_values().filter_map(|p| {
                 let p = p.replace('\\', "/");
                 (!(p.starts_with("Pack/Bootup_") && p.len() == 21))
@@ -459,8 +519,12 @@ impl BnpConverter {
 
     fn convert(mut self) -> Result<PathBuf> {
         let root = self.current_root.clone();
-        self.set_up_temp_map_state().context("Failed to set up temp map state for root")?;
+        self.set_up_temp_map_state()
+            .context("Failed to set up temp map state for root")?;
         self.convert_root()?;
+        // Options read fully reconstructed parent packs. Keep root_maps until
+        // all options have been evaluated so they inherit the parent's edits.
+        self.clear_temp_map_state()?;
 
         let opt_dir = root.join("options");
         if opt_dir.exists() {
@@ -478,32 +542,61 @@ impl BnpConverter {
                         .unwrap_or_default()
                 );
                 self.current_root = option;
-                self.set_up_temp_map_state()
-                    .with_context(|| format!(
+                self.set_up_temp_map_state().with_context(|| {
+                    format!(
                         "Failed to set up temp map state for {}",
                         self.current_root.display()
-                    ))?;
+                    )
+                })?;
                 self.convert_root()?;
-                self.clear_temp_map_state()
-                    .with_context(|| format!(
+                self.clear_temp_map_state().with_context(|| {
+                    format!(
                         "Failed to clear temp map state for {}",
                         self.current_root.display()
-                    ))?;
+                    )
+                })?;
             }
         }
         self.current_root = root;
-        self.clear_temp_map_state().context("Failed to clear temp map state for root")?;
+        self.root_maps.clear();
         Ok(self.current_root)
     }
 }
 
 pub fn unpack_bnp(core: &crate::core::Manager, path: &Path) -> Result<PathBuf> {
     let tempdir = crate::util::get_temp_folder();
+    let settings = core.settings();
+    unpack_bnp_into(
+        settings.dump().context("No dump for current platform")?,
+        settings.current_mode,
+        settings
+            .platform_config()
+            .context("No config for current platform")?
+            .language,
+        path,
+        &tempdir,
+    )
+}
+
+/// Evaluate BNP logs in an isolated working directory. The original is untouched.
+pub fn unpack_bnp_into(
+    dump: Arc<ResourceReader>,
+    platform: Platform,
+    game_lang: Language,
+    path: &Path,
+    tempdir: &Path,
+) -> Result<PathBuf> {
     if path.is_dir() {
-        crate::util::copy_dir(path, tempdir.as_path())
-            .context("Failed to copy files to temp folder")?;
+        crate::util::copy_dir(path, tempdir).context("Failed to copy files to temp folder")?;
     } else {
         log::info!("Extracting BNP…");
+        let archive =
+            sevenz_rust::Archive::open(path).context("Failed to read BNP archive header")?;
+        for file in &archive.files {
+            // sevenz-rust can encode its archive root as an empty directory.
+            if file.name.is_empty() && file.is_directory { continue; }
+            validate_bnp_relative_path(&file.name)?;
+        }
         extract_7z(path, &tempdir).context("Failed to extract BNP")?;
     }
     if tempdir.join("rules.txt").exists() && !tempdir.join("info.json").exists() {
@@ -511,25 +604,18 @@ pub fn unpack_bnp(core: &crate::core::Manager, path: &Path) -> Result<PathBuf> {
             .convert()
             .context("Failed to upgrade 2.x BNP")?;
     }
-    let (content, aoc) = uk_content::platform_prefixes(core.settings().current_mode.into());
+    let (content, aoc) = uk_content::platform_prefixes(platform.into());
     log::info!("Processing BNP logs…");
     let converter = BnpConverter {
-        platform: core.settings().current_mode,
-        game_lang: core
-            .settings()
-            .platform_config()
-            .context("No config for current platform. Have you configured your settings?")?
-            .language,
-        dump: core
-            .settings()
-            .dump()
-            .context("No dump for current mode. Have you configured your settings?")?,
+        platform,
+        game_lang,
+        dump,
         content,
         aoc,
         packs: Default::default(),
         parent_packs: Default::default(),
-        current_root: tempdir.clone(),
-        path: tempdir.clone(),
+        current_root: tempdir.to_owned(),
+        path: tempdir.to_owned(),
         opt_master_cache: Default::default(),
         root_maps: Default::default(),
         opt_maps: Default::default(),
@@ -537,6 +623,97 @@ pub fn unpack_bnp(core: &crate::core::Manager, path: &Path) -> Result<PathBuf> {
     let path = converter.convert()?;
     log::info!("BNP unpacked");
     Ok(path)
+}
+
+/// Keep BNPs as BNPs in storage; decoding supplies typed resources directly.
+pub fn register_native_reader(settings: &Arc<parking_lot::RwLock<Settings>>) {
+    let settings = Arc::downgrade(settings);
+    // Bound retained decoded data, rather than retaining every opened BNP forever.
+    let cache = parking_lot::Mutex::new(Vec::<(String, Arc<MemoryMod>)>::new());
+    uk_mod::native::register_bnp_opener(move |path, options| {
+        let settings = settings
+            .upgrade()
+            .context("BNP settings are no longer available")?;
+        let settings = settings
+            .try_read()
+            .context("BNP settings are busy; retry opening the mod")?;
+        let dump = settings
+            .dump()
+            .context("Configure a game dump before opening a BNP")?;
+        let platform = settings.current_mode;
+        let language = settings
+            .platform_config()
+            .context("No platform configuration")?
+            .language;
+        let metadata = fs::metadata(path)?;
+        let key = format!(
+            "{:?}|{}|{:?}|{:?}|{:?}|{}",
+            path.canonicalize()?,
+            metadata.len(),
+            metadata.modified()?,
+            platform,
+            language,
+            serde_yaml::to_string(&dump)?
+        );
+        drop(settings);
+        if path.is_file() {
+            if let Some((_, memory)) = cache.lock().iter().find(|(k, _)| k == &key) {
+                return ModReader::from_memory(path.to_owned(), memory.clone(), options);
+            }
+        }
+        let temp = tempfile::tempdir().context("Failed to create native BNP workspace")?;
+        let root = unpack_bnp_into(dump.clone(), platform, language, path, temp.path())
+            .with_context(|| format!("Failed to read BNP {}", path.display()))?;
+        let meta = ModPacker::parse_info(root.join("info.json"))?;
+        for group in &meta.options {
+            for option in uk_mod::ModOptionGroup::options(group) {
+                validate_bnp_relative_path(&option.path.to_string_lossy())?;
+            }
+        }
+        if meta.platform != uk_mod::ModPlatform::Specific(platform.into()) {
+            anyhow_ext::bail!("BNP platform does not match the configured game platform");
+        }
+        let mut memory = ModPacker::read_into_memory(&root, meta, vec![dump])
+            .context("Failed to decode native BNP resources")?;
+        let info: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(root.join("info.json"))?)?;
+        memory.base_priority =
+            info.get("priority").and_then(serde_json::Value::as_str) == Some("base");
+        if let Some(dependencies) = info.get("depends") {
+            for dependency in dependencies
+                .as_array()
+                .context("BNP depends must be an array")?
+            {
+                let id = dependency.as_str().context("Invalid BNP dependency ID")?;
+                let decoded =
+                    String::from_utf8(base64::engine::general_purpose::STANDARD.decode(id)?)?;
+                let (name, version) = decoded
+                    .rsplit_once("==")
+                    .context("Invalid BNP dependency ID contents")?;
+                memory.dependencies.push((name.into(), version.into()));
+            }
+        }
+        for layer in memory.manifests.keys() {
+            let log = root.join(layer).join("logs/rstb.json");
+            if log.is_file() {
+                memory.rstb_layers.insert(
+                    layer.clone(),
+                    serde_json::from_str(&fs::read_to_string(&log)?).with_context(|| {
+                        format!("Failed to read BNP RSTB log {}", log.display())
+                    })?,
+                );
+            }
+        }
+        let memory = Arc::new(memory);
+        if path.is_file() {
+            let mut cache = cache.lock();
+            if cache.len() >= 2 {
+                cache.remove(0);
+            }
+            cache.push((key, memory.clone()));
+        }
+        ModReader::from_memory(path.to_owned(), memory, options)
+    });
 }
 
 pub fn convert_bnp(core: &crate::core::Manager, path: &Path) -> Result<PathBuf> {
@@ -555,11 +732,16 @@ pub fn convert_bnp(core: &crate::core::Manager, path: &Path) -> Result<PathBuf> 
         ModPacker::parse_rules(tempdir.join("rules.txt")).context("Failed to parse BNP metadata")?
     };
     let name = meta.name.clone();
-    let new_mod = ModPacker::new(tempdir, tempfile.as_path(), Some(meta), vec![
-        core.settings()
-            .dump()
-            .context("No dump for current platform")?,
-    ])
+    let new_mod = ModPacker::new(
+        tempdir,
+        tempfile.as_path(),
+        Some(meta),
+        vec![
+            core.settings()
+                .dump()
+                .context("No dump for current platform")?,
+        ],
+    )
     .with_context(|| format!("Failed to package converted BNP for mod {}", name))?;
     new_mod.pack()
 }

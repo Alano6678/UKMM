@@ -87,6 +87,9 @@ impl<'de> Deserialize<'de> for ModReader {
                 let meta = meta.ok_or_else(|| serde::de::Error::missing_field("meta"))?;
                 let manifest =
                     manifest.ok_or_else(|| serde::de::Error::missing_field("manifest"))?;
+                if crate::native::is_bnp(&path) {
+                    return ModReader::open(path, options).map_err(serde::de::Error::custom);
+                }
                 Ok(ModReader {
                     meta,
                     decompressor: super::init_decompressor(),
@@ -97,6 +100,7 @@ impl<'de> Deserialize<'de> for ModReader {
                             .map_err(serde::de::Error::custom)?,
                     )),
                     path,
+                    memory: None,
                 })
             }
         }

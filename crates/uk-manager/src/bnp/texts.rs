@@ -27,30 +27,32 @@ impl BnpConverter {
                     langs
                 )
             })?;
-            let base = self.get_from_master_sarc(&format!(
-                "Pack/Bootup_{}.pack//Message/Msg_{}.product.ssarc",
-                self.game_lang, self.game_lang,
-            )).expect("Your language in UKMM's settings should be a language your dump has.");
-            if let Ok(mut texts) = MessagePack::from_binary(base) {
+            let base = self
+                .get_from_master_sarc(&format!(
+                    "Pack/Bootup_{}.pack//Message/Msg_{}.product.ssarc",
+                    self.game_lang, self.game_lang,
+                ))
+                .context("Could not read configured game language from dump")?;
+            let mut texts = MessagePack::from_binary(base)
+                .context("Could not parse game message pack while reading BNP texts")?;
+            {
                 for (file, diff) in diff {
                     let msyt = texts
                         .0
                         .entry(file.trim_end_matches(".msyt").into())
-                        .or_insert_with(|| {
-                            Msyt {
-                                entries: Default::default(),
-                                msbt:    MsbtInfo {
-                                    group_count: diff.len() as u32,
-                                    atr1_unknown: Some(if file.contains("EventFlowMsg") {
-                                        0
-                                    } else {
-                                        4
-                                    }),
-                                    ato1: None,
-                                    tsy1: None,
-                                    nli1: None,
-                                },
-                            }
+                        .or_insert_with(|| Msyt {
+                            entries: Default::default(),
+                            msbt: MsbtInfo {
+                                group_count: diff.len() as u32,
+                                atr1_unknown: Some(if file.contains("EventFlowMsg") {
+                                    0
+                                } else {
+                                    4
+                                }),
+                                ato1: None,
+                                tsy1: None,
+                                nli1: None,
+                            },
                         });
                     msyt.entries
                         .extend(diff.into_iter().map(|(k, v)| (k.into(), v)));

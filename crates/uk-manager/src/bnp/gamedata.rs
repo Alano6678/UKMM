@@ -18,21 +18,22 @@ impl BnpConverter {
             let base = self
                 .get_from_master_sarc("Pack/Bootup.pack//GameData/gamedata.ssarc")
                 .context("Failed to parse gamedata pack from game dump")?;
-            if let Ok(mut base) = GameDataPack::from_binary(base) {
+            let mut base = GameDataPack::from_binary(base)
+                .context("Could not parse game data while reading BNP flags")?;
+            {
                 fn simple_add(base: &mut GameData, diff: &Map) -> Result<()> {
                     if let Some(Byml::Map(add)) = diff.get("add") {
-                        base.flags.extend(add.iter().filter_map(|(name, flag)| {
-                            flag.try_into()
-                                .ok()
-                                .or_else(|| {
+                        for (name, flag) in add {
+                            let parsed = FlagData::try_from(flag)
+                                .or_else(|error| {
                                     let mut flag = flag.clone();
-                                    flag.as_mut_map()
-                                        .ok()?
-                                        .insert("DataName".into(), name.into());
-                                    (&flag).try_into().ok()
+                                    flag.as_mut_map()?.insert("DataName".into(), name.into());
+                                    flag.as_mut_map()?.insert("DeleteRev".into(), Byml::I32(-1));
+                                    FlagData::try_from(&flag).context(error)
                                 })
-                                .map(|f| (name.clone(), f))
-                        }));
+                                .with_context(|| format!("Invalid BNP game data flag {name}"))?;
+                            base.flags.insert(name.clone(), parsed);
+                        }
                     }
                     if let Some(Byml::Array(del)) = diff.get("del") {
                         for name in del {
@@ -80,7 +81,8 @@ impl BnpConverter {
                                     .or_else(|e| {
                                         let mut flag = flag.clone();
                                         flag.as_mut_map()?.insert("DataName".into(), name.into());
-                                        flag.as_mut_map()?.insert("DeleteRev".into(), Byml::I32(-1));
+                                        flag.as_mut_map()?
+                                            .insert("DeleteRev".into(), Byml::I32(-1));
                                         (&flag).try_into().context(e)
                                     })
                                     .with_context(|| {

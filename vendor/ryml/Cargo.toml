@@ -1,0 +1,22 @@
+[package]
+name = "ryml"
+authors = ["Caleb Smith <c.smith@tuta.io>"]
+description = "Parse YAML and do it fast: Rapid YAML bindings for Rust"
+license = "GPL-3.0-or-later"
+readme = "README.md"
+repository = "https://github.com/NiceneNerd/ryml"
+keywords = ["yaml", "ryml", "rapidyaml", "ffi", "bindings"]
+version = "0.3.2"
+edition = "2021"
+
+[dependencies]
+no_std_io2 = "0.9.4"
+auto-enum = "0.1.2"
+cxx = "1.0.72"
+thiserror-no-std = "2.0.2"
+
+[build-dependencies]
+cxx-build = "1.0.72"
+
+[features]
+std = ["thiserror-no-std/std"]

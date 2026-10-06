@@ -37,6 +37,7 @@ pub use handlers::register_handlers;
 use uk_localization::string_ext::LocString;
 
 fn is_probably_a_bnp(path: &Path) -> bool {
+    if uk_mod::native::is_bnp(path) { return true; }
     match path
         .extension()
         .and_then(|e| e.to_str().map(|e| e.to_lowercase()))
@@ -181,9 +182,11 @@ fn is_probably_a_mod_and_has_meta(path: &Path) -> (bool, bool) {
 pub fn open_mod(core: &Manager, path: &Path, meta: Option<Meta>) -> Result<Message> {
     log::info!("Opening mod at {}", path.display());
     if is_probably_a_bnp(path) {
-        let mod_ = convert_bnp(core, path).context("Failed to convert BNP to UKMM mod")?;
+        let mod_ = if path.file_name().is_some_and(|n| n == "info.json") {
+            path.parent().context("BNP metadata has no parent directory")?
+        } else { path };
         return Ok(Message::HandleMod(Mod::from_reader(
-            ModReader::open_peek(mod_, vec![]).context("Failed to open converted mod")?,
+            ModReader::open_peek(mod_, vec![]).context("Failed to open native BNP")?,
         )));
     }
     let mod_ = match ModReader::open_peek(path, vec![]) {

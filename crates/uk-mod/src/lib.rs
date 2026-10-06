@@ -12,6 +12,7 @@ use uk_content::{
     prelude::Endian,
     util::{HashSet, IndexMap},
 };
+pub mod native;
 pub mod pack;
 pub mod unpack;
 pub use zstd;

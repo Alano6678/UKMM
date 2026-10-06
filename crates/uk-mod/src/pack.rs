@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeSet, HashSet},
     io::Write,
     path::{Path, PathBuf},
-    sync::{atomic::AtomicUsize, Arc, LazyLock},
+    sync::{Arc, LazyLock, atomic::AtomicUsize},
 };
 
 use anyhow_ext::{Context, Result};
@@ -16,19 +16,19 @@ use rayon::prelude::*;
 use roead::{sarc::Sarc, yaz0::decompress_if};
 pub use sanitise_file_name::sanitise;
 use serde::Deserialize;
-use serde_with::{serde_as, DefaultOnError};
+use serde_with::{DefaultOnError, serde_as};
 use smartstring::alias::String;
 use uk_content::{
     canonicalize,
     constants::Language,
     platform_prefixes,
     prelude::{Endian, Mergeable},
-    resource::{is_mergeable_sarc, ResourceData},
+    resource::{ResourceData, is_mergeable_sarc},
 };
 use uk_util::PathExt as UkPathExt;
 use zip::{
-    write::{FileOptions, SimpleFileOptions},
     ZipWriter as ZipW,
+    write::{FileOptions, SimpleFileOptions},
 };
 
 use crate::{
@@ -37,6 +37,36 @@ use crate::{
 };
 
 pub type ZipWriter = Arc<Mutex<ZipW<fs::File>>>;
+
+/// Decoded mod layers. Native formats can feed these directly to the merger.
+#[derive(Debug)]
+pub struct MemoryMod {
+    pub meta: Meta,
+    pub resources: uk_content::util::HashMap<PathBuf, ResourceData>,
+    pub manifests: uk_content::util::HashMap<PathBuf, Manifest>,
+    pub rstb_layers: uk_content::util::HashMap<PathBuf, uk_content::util::HashMap<String, u32>>,
+    pub base_priority: bool,
+    pub dependencies: Vec<(String, String)>,
+}
+
+impl MemoryMod {
+    pub fn manifest(&self, options: &[ModOption]) -> Result<Manifest> {
+        let mut manifest = self
+            .manifests
+            .get(Path::new(""))
+            .cloned()
+            .context("Native mod missing base manifest")?;
+        for option in options {
+            let root = Path::new("options").join(&option.path);
+            manifest.extend(
+                self.manifests.get(&root).with_context(|| {
+                    format!("Native mod missing option {}", option.path.display())
+                })?,
+            );
+        }
+        Ok(manifest)
+    }
+}
 
 static NX_HASH_TABLE: LazyLock<StockHashTable> =
     LazyLock::new(|| StockHashTable::new(&botw_utils::hashes::Platform::Switch));
@@ -47,7 +77,8 @@ pub struct ModPacker {
     source_dir: PathBuf,
     current_root: PathBuf,
     meta: Meta,
-    zip: ZipWriter,
+    zip: Option<ZipWriter>,
+    memory: Option<Arc<Mutex<MemoryMod>>>,
     endian: Endian,
     built_resources: dashmap::DashSet<String>,
     masters: Vec<Arc<uk_reader::ResourceReader>>,
@@ -78,27 +109,29 @@ impl std::fmt::Debug for ModPacker {
 #[serde(default)]
 #[serde_as]
 struct InfoJson {
-    name:     String,
-    desc:     String,
+    name: String,
+    desc: String,
     #[serde(deserialize_with = "serde_with::As::<DefaultOnError>::deserialize")]
-    version:  String,
+    version: String,
     platform: String,
-    options:  BnpOptions,
+    options: BnpOptions,
+    author: String,
+    url: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
 struct BnpOptions {
     #[serde(default)]
-    multi:  Vec<BnpOption>,
+    multi: Vec<BnpOption>,
     #[serde(default)]
     single: Vec<BnpGroup>,
 }
 
 #[derive(Debug, Deserialize)]
 struct BnpOption {
-    name:    String,
-    desc:    String,
-    folder:  PathBuf,
+    name: String,
+    desc: String,
+    folder: PathBuf,
     default: Option<bool>,
 }
 
@@ -137,17 +170,17 @@ impl RequireValue {
     fn is_true(&self) -> bool {
         match self {
             Self::Bool(b) => *b,
-            Self::String(s) => s.is_empty() || s == "false",
+            Self::String(s) => s.eq_ignore_ascii_case("true"),
         }
     }
 }
 
 #[derive(Debug, Deserialize)]
 struct BnpGroup {
-    name:     String,
-    desc:     String,
+    name: String,
+    desc: String,
     required: Option<RequireValue>,
-    options:  Vec<BnpOption>,
+    options: Vec<BnpOption>,
 }
 
 impl From<BnpGroup> for ExclusiveOptionGroup {
@@ -155,7 +188,11 @@ impl From<BnpGroup> for ExclusiveOptionGroup {
         Self {
             name: group.name,
             description: group.desc,
-            default: None,
+            default: group
+                .options
+                .iter()
+                .find(|opt| opt.default == Some(true))
+                .map(|opt| opt.folder.clone()),
             options: group.options.into_iter().map(|opt| opt.into()).collect(),
             required: group.required.map(|r| r.is_true()).unwrap_or(false),
         }
@@ -201,7 +238,7 @@ impl ModPacker {
             name: info.name,
             description: info.desc,
             category: crate::ModCategory::Other,
-            author: Default::default(),
+            author: info.author,
             masters: Default::default(),
             options: (!info.options.multi.is_empty())
                 .then(|| multi_from_bnp_multi(info.options.multi))
@@ -218,7 +255,7 @@ impl ModPacker {
                 "switch" => ModPlatform::Specific(Endian::Little),
                 _ => anyhow_ext::bail!("Invalid platform value in info.json"),
             },
-            url: Default::default(),
+            url: info.url,
             version: info.version,
         })
     }
@@ -284,7 +321,8 @@ impl ModPacker {
                 current_root: source_dir.clone(),
                 source_dir,
                 endian,
-                zip,
+                zip: Some(zip),
+                memory: None,
                 masters,
                 hash_table: match endian {
                     Endian::Little => &NX_HASH_TABLE,
@@ -292,9 +330,10 @@ impl ModPacker {
                 },
                 meta,
                 built_resources: Default::default(),
-                compressor: Arc::new(Mutex::new(
-                    zstd::bulk::Compressor::with_dictionary(8, super::DICTIONARY)?,
-                )),
+                compressor: Arc::new(Mutex::new(zstd::bulk::Compressor::with_dictionary(
+                    8,
+                    super::DICTIONARY,
+                )?)),
                 _zip_opts: FileOptions::default()
                     .compression_method(zip::CompressionMethod::Stored),
                 _out_file: dest_file,
@@ -303,17 +342,64 @@ impl ModPacker {
         inner(source.as_ref(), dest.as_ref(), meta, masters)
     }
 
+    /// Decode unpacked game resources without writing or rereading a ZIP.
+    pub fn read_into_memory(
+        source: &Path,
+        meta: Meta,
+        masters: Vec<Arc<uk_reader::ResourceReader>>,
+    ) -> Result<MemoryMod> {
+        let endian = match meta.platform {
+            ModPlatform::Specific(endian) => endian,
+            ModPlatform::Universal => anyhow_ext::bail!("Native BNP must declare its platform"),
+        };
+        let memory = Arc::new(Mutex::new(MemoryMod {
+            meta: meta.clone(),
+            resources: Default::default(),
+            manifests: Default::default(),
+            rstb_layers: Default::default(),
+            base_priority: false,
+            dependencies: vec![],
+        }));
+        let mut packer = Self {
+            source_dir: source.to_owned(),
+            current_root: source.to_owned(),
+            meta,
+            zip: None,
+            memory: Some(memory.clone()),
+            endian,
+            built_resources: Default::default(),
+            masters,
+            hash_table: match endian {
+                Endian::Little => &NX_HASH_TABLE,
+                Endian::Big => &WIIU_HASH_TABLE,
+            },
+            compressor: Arc::new(Mutex::new(zstd::bulk::Compressor::with_dictionary(
+                8,
+                super::DICTIONARY,
+            )?)),
+            _zip_opts: FileOptions::default().compression_method(zip::CompressionMethod::Stored),
+            _out_file: source.to_owned(),
+        };
+        packer.pack_roots()?;
+        drop(packer);
+        Ok(Arc::try_unwrap(memory)
+            .map_err(|_| anyhow::anyhow!("Native mod still borrowed"))?
+            .into_inner())
+    }
+
     fn write_resource(&self, canon: &str, resource: &ResourceData) -> Result<()> {
-        let data = minicbor_ser::to_vec(&resource)
-            .map_err(|e| anyhow::format_err!("{:?}", e))
-            .with_context(|| jstr!("Failed to serialize {canon}"))?;
         let zip_path = self
             .current_root
             .strip_prefix(&self.source_dir)?
             .join(canon);
-        {
+        if let Some(memory) = &self.memory {
+            memory.lock().resources.insert(zip_path, resource.clone());
+        } else {
+            let data = minicbor_ser::to_vec(&resource)
+                .map_err(|e| anyhow::anyhow!("{e}"))
+                .with_context(|| jstr!("Failed to serialize {canon}"))?;
             log::trace!("Writing {} to ZIP", canon);
-            let mut zip = self.zip.lock();
+            let mut zip = self.zip.as_ref().context("Missing ZIP writer")?.lock();
             match zip.start_file(zip_path.to_slash_lossy(), self._zip_opts) {
                 Ok(_) => zip.write_all(&self.compressor.lock().compress(&data)?)?,
                 Err(zip::result::ZipError::InvalidArchive("Duplicate filename")) => {
@@ -437,7 +523,10 @@ impl ModPacker {
             return Ok(());
         }
         if canon.starts_with("Pack/Bootup_") {
-            log::trace!("{} must always contain the same single file, skipping direct processing", &canon);
+            log::trace!(
+                "{} must always contain the same single file, skipping direct processing",
+                &canon
+            );
             return Ok(());
         }
         if resource.as_binary().is_some() && self.meta.platform == ModPlatform::Universal {
@@ -454,31 +543,27 @@ impl ModPacker {
             .trim_start_matches(prefixes.0)
             .trim_start_matches(prefixes.1)
             .trim_start_matches('/');
-        let reference = self
-            .masters
-            .iter()
-            .rev()
-            .find_map(|master| {
-                master
-                    .get_data(name.as_str())
-                    .or_else(|err| {
-                        log::trace!("{err}");
-                        if let Some(lang) = canon
-                            .starts_with("Message/Msg_")
-                            .then(|| Language::from_message_path(ref_name.as_ref()))
-                            .flatten()
-                        {
-                            let languages = master.languages();
-                            match languages.iter().find(|l| l.short() == lang.short()) {
-                                Some(ref_lang) => master.get_data(ref_lang.message_path().as_str()),
-                                None => Err(err),
-                            }
-                        } else {
-                            Err(err)
+        let reference = self.masters.iter().rev().find_map(|master| {
+            master
+                .get_data(name.as_str())
+                .or_else(|err| {
+                    log::trace!("{err}");
+                    if let Some(lang) = canon
+                        .starts_with("Message/Msg_")
+                        .then(|| Language::from_message_path(ref_name.as_ref()))
+                        .flatten()
+                    {
+                        let languages = master.languages();
+                        match languages.iter().find(|l| l.short() == lang.short()) {
+                            Some(ref_lang) => master.get_data(ref_lang.message_path().as_str()),
+                            None => Err(err),
                         }
-                    })
-                    .ok()
-            });
+                    } else {
+                        Err(err)
+                    }
+                })
+                .ok()
+        });
         log::trace!("Resource {} has a master: {}", &canon, reference.is_some());
         if let (Some(res), Some(ref_res)) = (
             resource.as_mergeable(),
@@ -624,14 +709,16 @@ impl ModPacker {
                 )?;
                 manifest.aoc_files.insert("Pack/AocMainField.pack".into());
             }
+            let root = root.strip_prefix(&self_.source_dir)?.to_owned();
+            if let Some(memory) = &self_.memory {
+                memory.lock().manifests.insert(root, manifest);
+                return Ok(());
+            }
             let manifest = serde_yaml::to_string(&manifest)?;
             log::info!("Writing manifest");
-            let mut zip = self_.zip.lock();
+            let mut zip = self_.zip.as_ref().context("Missing ZIP writer")?.lock();
             zip.start_file(
-                root.strip_prefix(&self_.source_dir)
-                    .unwrap()
-                    .join("manifest.yml")
-                    .to_slash_lossy(),
+                root.join("manifest.yml").to_slash_lossy(),
                 self_._zip_opts,
             )?;
             zip.write_all(manifest.as_bytes())?;
@@ -655,7 +742,7 @@ impl ModPacker {
             for ext in ["jpg", "jpeg", "png", "svg"] {
                 let path = self.source_dir.join(name).with_extension(ext);
                 if path.exists() {
-                    let mut zip = self.zip.lock();
+                    let mut zip = self.zip.as_ref().context("Missing ZIP writer")?.lock();
                     zip.start_file(format!("thumb.{}", ext), self._zip_opts)?;
                     zip.write_all(&fs::read(path)?)?;
                     return Ok(());
@@ -665,7 +752,7 @@ impl ModPacker {
         Ok(())
     }
 
-    pub fn pack(mut self) -> Result<PathBuf> {
+    fn pack_roots(&mut self) -> Result<()> {
         self.pack_root(&self.source_dir).with_context(|| {
             format!(
                 "Failed to package mod root at {} for mod {}",
@@ -691,8 +778,13 @@ impl ModPacker {
                 })?;
             }
         }
+        Ok(())
+    }
+
+    pub fn pack(mut self) -> Result<PathBuf> {
+        self.pack_roots()?;
         self.pack_thumbnail()?;
-        match Arc::try_unwrap(self.zip).map(|z| z.into_inner()) {
+        match Arc::try_unwrap(self.zip.context("Missing ZIP writer")?).map(|z| z.into_inner()) {
             Ok(mut zip) => {
                 log::info!("Writing meta");
                 zip.start_file("meta.yml", self._zip_opts)?;
@@ -715,6 +807,19 @@ mod tests {
 
     use super::*;
     use crate::{ModOption, MultipleOptionGroup, OptionGroup};
+    #[test]
+    fn bnp_exclusive_option_preserves_default_and_required() {
+        let group: BnpGroup = serde_json::from_value(serde_json::json!({
+            "name": "Choice", "desc": "", "required": "false",
+            "options": [{"name": "Default", "desc": "", "folder": "chosen", "default": true}]
+        }))
+        .unwrap();
+        let converted = ExclusiveOptionGroup::from(group);
+        assert_eq!(converted.default, Some(PathBuf::from("chosen")));
+        assert!(!converted.required);
+        assert!(RequireValue::String("true".into()).is_true());
+        assert!(!RequireValue::String("".into()).is_true());
+    }
     #[test]
     fn pack_mod() {
         env_logger::init();
