@@ -42,7 +42,7 @@ pub type ZipWriter = Arc<Mutex<ZipW<fs::File>>>;
 #[derive(Debug)]
 pub struct MemoryMod {
     pub meta: Meta,
-    pub resources: uk_content::util::HashMap<PathBuf, ResourceData>,
+    pub resources: uk_content::util::HashMap<PathBuf, Arc<ResourceData>>,
     pub manifests: uk_content::util::HashMap<PathBuf, Manifest>,
     pub rstb_layers: uk_content::util::HashMap<PathBuf, uk_content::util::HashMap<String, u32>>,
     pub base_priority: bool,
@@ -393,7 +393,10 @@ impl ModPacker {
             .strip_prefix(&self.source_dir)?
             .join(canon);
         if let Some(memory) = &self.memory {
-            memory.lock().resources.insert(zip_path, resource.clone());
+            memory
+                .lock()
+                .resources
+                .insert(zip_path, Arc::new(resource.clone()));
         } else {
             let data = minicbor_ser::to_vec(&resource)
                 .map_err(|e| anyhow::anyhow!("{e}"))
@@ -633,7 +636,14 @@ impl ModPacker {
                     v.1
                 );
             }
-            self.process_resource((&name).into(), canon.clone(), resource, is_new_sarc)?;
+            // Embedded models can differ from an external model with the same
+            // name. Keep their archive scope instead of collapsing both copies.
+            let scoped_name = format!("{}//{}", path.to_slash_lossy(), file.unwrap_name());
+            if canon.ends_with(".bfres") {
+                self.process_resource(scoped_name.clone().into(), canonicalize(&scoped_name), resource, is_new_sarc)?;
+            } else {
+                self.process_resource((&name).into(), canon.clone(), resource, is_new_sarc)?;
+            }
             if is_mergeable_sarc(canon.as_str(), file_data.as_ref()) {
                 log::trace!(
                     "Resource {} in SARC {} is a mergeable SARC, processing contents",
@@ -642,7 +652,7 @@ impl ModPacker {
                 );
                 self.process_sarc(
                     Sarc::new(file_data.as_ref())?,
-                    name.as_ref(),
+                    scoped_name.as_ref(),
                     is_new_sarc,
                     is_aoc,
                 )
@@ -717,10 +727,7 @@ impl ModPacker {
             let manifest = serde_yaml::to_string(&manifest)?;
             log::info!("Writing manifest");
             let mut zip = self_.zip.as_ref().context("Missing ZIP writer")?.lock();
-            zip.start_file(
-                root.join("manifest.yml").to_slash_lossy(),
-                self_._zip_opts,
-            )?;
+            zip.start_file(root.join("manifest.yml").to_slash_lossy(), self_._zip_opts)?;
             zip.write_all(manifest.as_bytes())?;
             Ok(())
         }

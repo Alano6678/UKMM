@@ -92,7 +92,6 @@ impl<'de> Deserialize<'de> for ModReader {
                 }
                 Ok(ModReader {
                     meta,
-                    decompressor: super::init_decompressor(),
                     manifest,
                     options,
                     zip: Arc::new(Some(

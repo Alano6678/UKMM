@@ -74,7 +74,7 @@ fn main() -> Result<()> {
                 }
             }
             None => {
-                table.remove(entry.key().as_str());
+                uk_content::util::remove_rstb_resource(&mut table, entry.key().as_str());
             }
         }
     }

@@ -320,17 +320,17 @@ impl Settings {
     }
 
     pub fn save(&self) -> Result<()> {
-        if !Self::path().parent().unwrap().exists() {
-            fs::create_dir_all(Self::path().parent().unwrap())?;
+        self.save_to(Self::path())
+    }
+
+    /// Persist to an explicit location without rebuilding the game readers.
+    pub fn save_to(&self, path: &Path) -> Result<()> {
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            fs::create_dir_all(parent)?;
         }
         log::debug!("Saving settings:\n{:#?}", self);
-        let _ = crate::util::USE_SZ.compare_exchange_weak(
-            !self.system_7z,
-            self.system_7z,
-            std::sync::atomic::Ordering::Relaxed,
-            std::sync::atomic::Ordering::Relaxed,
-        );
-        fs::write(Self::path(), serde_yaml::to_string(self)?)?;
+        fs::write(path, serde_yaml::to_string(self)?)?;
+        crate::util::USE_SZ.store(self.system_7z, std::sync::atomic::Ordering::Release);
         log::info!("Settings saved");
         Ok(())
     }

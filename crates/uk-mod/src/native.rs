@@ -11,6 +11,11 @@ use crate::{ModOption, unpack::ModReader};
 
 type BnpOpener = dyn Fn(&Path, Vec<ModOption>) -> Result<ModReader> + Send + Sync;
 static BNP_OPENER: LazyLock<RwLock<Option<Arc<BnpOpener>>>> = LazyLock::new(|| RwLock::new(None));
+static BNP_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn generation() -> u64 {
+    BNP_GENERATION.load(std::sync::atomic::Ordering::Acquire)
+}
 
 pub fn is_bnp(path: &Path) -> bool {
     path.extension()
@@ -23,6 +28,7 @@ pub fn register_bnp_opener(
     opener: impl Fn(&Path, Vec<ModOption>) -> Result<ModReader> + Send + Sync + 'static,
 ) {
     *BNP_OPENER.write() = Some(Arc::new(opener));
+    BNP_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);
 }
 
 pub(crate) fn open_bnp(path: &Path, options: Vec<ModOption>) -> Result<ModReader> {

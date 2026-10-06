@@ -30,6 +30,7 @@ use crate::{
 mod actorinfo;
 mod areadata;
 mod aslist;
+mod cache;
 mod deepmerge;
 mod drops;
 mod dstatic;
@@ -54,7 +55,7 @@ fn validate_bnp_relative_path(path: &str) -> Result<()> {
         || normalized.contains(':')
         || normalized.split('/').any(|part| part == "..")
     {
-        anyhow_ext::bail!("BNP contains an invalid relative path: {path}");
+        anyhow_ext::bail!("BNP contains an invalid relative path: {path:?}");
     }
     Ok(())
 }
@@ -80,12 +81,16 @@ pub fn parse_aamp_diff(header_name: &str, pio: &ParameterIO) -> Result<AampDiffM
         .0
         .values()
         .filter_map(|s| s.as_str().ok())
+        // Some BNP logs retain unused file-table slots. They do not identify
+        // an edit; validate every nonempty resource path as before.
+        .filter(|file| !file.is_empty())
         .try_fold(
             FxHashMap::default(),
             |mut acc, file| -> Result<FxHashMap<String, AampDiffEntry>> {
                 let parts = file.split("//").collect::<Vec<_>>();
                 for part in &parts {
-                    validate_bnp_relative_path(part)?;
+                    validate_bnp_relative_path(part)
+                        .with_context(|| format!("Invalid {header_name} entry {file:?}"))?;
                 }
                 if parts.is_empty() {
                     anyhow_ext::bail!("Why are there no diff path parts?");
@@ -440,11 +445,12 @@ impl BnpConverter {
                 .map(|n| n != "options")
                 .unwrap_or(false);
             let log: FxHashMap<String, String> = serde_json::from_str(
-                &fs::read_to_string(packs_path).context("Failed to read packs.json")?,
+                &fs::read_to_string(&packs_path).context("Failed to read packs.json")?,
             )
             .context("Failed to parse packs.json")?;
             for path in log.values() {
-                validate_bnp_relative_path(path)?;
+                validate_bnp_relative_path(path)
+                    .with_context(|| format!("Invalid entry in {}", packs_path.display()))?;
             }
             for pack in log.into_values().filter_map(|p| {
                 let p = p.replace('\\', "/");
@@ -594,8 +600,11 @@ pub fn unpack_bnp_into(
             sevenz_rust::Archive::open(path).context("Failed to read BNP archive header")?;
         for file in &archive.files {
             // sevenz-rust can encode its archive root as an empty directory.
-            if file.name.is_empty() && file.is_directory { continue; }
-            validate_bnp_relative_path(&file.name)?;
+            if file.name.is_empty() && file.is_directory {
+                continue;
+            }
+            validate_bnp_relative_path(&file.name)
+                .with_context(|| format!("Invalid archive member in {}", path.display()))?;
         }
         extract_7z(path, &tempdir).context("Failed to extract BNP")?;
     }
@@ -630,6 +639,11 @@ pub fn register_native_reader(settings: &Arc<parking_lot::RwLock<Settings>>) {
     let settings = Arc::downgrade(settings);
     // Bound retained decoded data, rather than retaining every opened BNP forever.
     let cache = parking_lot::Mutex::new(Vec::<(String, Arc<MemoryMod>)>::new());
+    let archive_hashes = parking_lot::Mutex::new(FxHashMap::<
+        PathBuf,
+        (u64, std::time::SystemTime, String),
+    >::default());
+    let dump_signatures = parking_lot::Mutex::new(FxHashMap::<String, Option<String>>::default());
     uk_mod::native::register_bnp_opener(move |path, options| {
         let settings = settings
             .upgrade()
@@ -645,20 +659,79 @@ pub fn register_native_reader(settings: &Arc<parking_lot::RwLock<Settings>>) {
             .platform_config()
             .context("No platform configuration")?
             .language;
+        let cache_dir = settings.platform_dir().join("cache/bnp");
         let metadata = fs::metadata(path)?;
-        let key = format!(
-            "{:?}|{}|{:?}|{:?}|{:?}|{}",
-            path.canonicalize()?,
-            metadata.len(),
-            metadata.modified()?,
-            platform,
-            language,
-            serde_yaml::to_string(&dump)?
-        );
+        let modified = metadata.modified()?;
         drop(settings);
+        let (key, persistent) = if path.is_file() {
+            let absolute = path.canonicalize()?;
+            let mut hashes = archive_hashes.lock();
+            let digest = match hashes.get(&absolute) {
+                Some((size, time, digest)) if *size == metadata.len() && *time == modified => {
+                    digest.clone()
+                }
+                _ => {
+                    let digest = cache::archive_digest(path)?;
+                    hashes.insert(absolute, (metadata.len(), modified, digest.clone()));
+                    digest
+                }
+            };
+            drop(hashes);
+            let source = dump.source_ser();
+            let mut signatures = dump_signatures.lock();
+            let signature = match signatures.get(&source) {
+                Some(signature) => signature.clone(),
+                None => {
+                    let signature = match cache::dump_signature(&dump) {
+                        Ok(signature) => Some(signature),
+                        Err(error) => {
+                            log::warn!(
+                                "Cannot fingerprint game dump; using memory-only BNP cache: {error:#}"
+                            );
+                            None
+                        }
+                    };
+                    signatures.insert(source, signature.clone());
+                    signature
+                }
+            };
+            let context = match &signature {
+                Some(signature) => format!("{platform:?}|{language:?}|{signature}"),
+                None => format!(
+                    "memory-only|{platform:?}|{language:?}|{}",
+                    dump.source_ser()
+                ),
+            };
+            (cache::cache_key(&digest, &context), signature.is_some())
+        } else {
+            (String::new(), false)
+        };
         if path.is_file() {
             if let Some((_, memory)) = cache.lock().iter().find(|(k, _)| k == &key) {
                 return ModReader::from_memory(path.to_owned(), memory.clone(), options);
+            }
+            let cache_path = cache_dir.join(format!("{key}.cache"));
+            if persistent {
+                match cache::load(&cache_path, &key) {
+                    Ok(memory) => {
+                        log::info!("Loaded decoded BNP cache for {}", path.display());
+                        let memory = Arc::new(memory);
+                        let mut cache = cache.lock();
+                        if cache.len() >= 2 {
+                            cache.remove(0);
+                        }
+                        cache.push((key, memory.clone()));
+                        return ModReader::from_memory(path.to_owned(), memory, options);
+                    }
+                    Err(error) => {
+                        if cache_path.exists() {
+                            log::warn!(
+                                "Ignoring invalid BNP cache {}: {error:#}",
+                                cache_path.display()
+                            );
+                        }
+                    }
+                }
             }
         }
         let temp = tempfile::tempdir().context("Failed to create native BNP workspace")?;
@@ -667,7 +740,8 @@ pub fn register_native_reader(settings: &Arc<parking_lot::RwLock<Settings>>) {
         let meta = ModPacker::parse_info(root.join("info.json"))?;
         for group in &meta.options {
             for option in uk_mod::ModOptionGroup::options(group) {
-                validate_bnp_relative_path(&option.path.to_string_lossy())?;
+                validate_bnp_relative_path(&option.path.to_string_lossy())
+                    .with_context(|| format!("Invalid BNP option folder for {:?}", option.name))?;
             }
         }
         if meta.platform != uk_mod::ModPlatform::Specific(platform.into()) {
@@ -706,6 +780,14 @@ pub fn register_native_reader(settings: &Arc<parking_lot::RwLock<Settings>>) {
         }
         let memory = Arc::new(memory);
         if path.is_file() {
+            // A cache failure must not prevent using the already decoded mod.
+            if persistent {
+                if let Err(error) =
+                    cache::save(&cache_dir.join(format!("{key}.cache")), &key, &memory)
+                {
+                    log::warn!("Could not persist BNP cache: {error:#}");
+                }
+            }
             let mut cache = cache.lock();
             if cache.len() >= 2 {
                 cache.remove(0);

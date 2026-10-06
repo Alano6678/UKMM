@@ -485,46 +485,55 @@ impl App {
                     settings::CONFIG.write().clear();
                 }
                 Message::SaveSettings => {
-                    let mut needs_reset = false;
-                    self.core.settings().platform_config().map(|old_plat| {
-                        old_plat.deploy_config.as_ref().map(|old_dep| {
-                            if let Some(new_plat) = &self.temp_settings.platform_config() {
-                                new_plat.deploy_config.as_ref().map(|new_dep| {
-                                    if old_dep.layout != new_dep.layout ||
-                                        old_dep.method != new_dep.method ||
-                                        old_dep.output != new_dep.output {
-                                        if let Ok(_) = self.core.settings()
-                                            .wipe_output(self.core.settings().current_mode.into()) {
-                                            needs_reset = true;
-                                        }
-                                    }
-                                });
-                            }
-                        });
-                    });
-                    let save_res = self.temp_settings.save().and_then(|_| {
-                        self.core.reload()?;
-                        Ok(())
-                    });
-                    match save_res {
-                        Ok(()) => {
-                            self.toasts.add({
-                                let mut toast = Toast::success("Settings_Saved".localize());
-                                toast.set_duration(Some(Duration::new(2, 0)));
-                                toast
-                            });
-                            if let Some(dump) = self.core.settings().dump() {
-                                dump.clear_cache()
-                            }
-                            self.package_builder.borrow_mut().reset(self.platform());
-                            self.do_update(Message::ClearSelect);
-                            self.do_update(Message::ResetMods(None));
-                            if needs_reset {
-                                self.do_update(Message::ResetPending);
+                    let next = std::panic::AssertUnwindSafe(self.temp_settings.clone());
+                    let forms = settings::CONFIG.read().clone();
+                    self.do_task(move |core| {
+                        let mut next = (*next).clone();
+                        for (platform, form) in forms {
+                            let config = match platform {
+                                Platform::WiiU => &mut next.wiiu_config,
+                                Platform::Switch => &mut next.switch_config,
+                            };
+                            let changed = match config.as_ref() {
+                                Some(old) => form.ne(old),
+                                None => !form.dump.is_empty()
+                                    || !form.deploy_config.output.as_os_str().is_empty(),
+                            };
+                            if changed {
+                                *config = Some(form.apply(config.as_ref(), platform)?);
                             }
                         }
-                        Err(e) => self.do_update(Message::Error(e)),
-                    };
+                        let previous = core.settings().clone();
+                        let changed_target = previous.platform_config().and_then(|p| p.deploy_config.as_ref())
+                            .zip(next.platform_config().and_then(|p| p.deploy_config.as_ref()))
+                            .is_some_and(|(old, new)| old.layout != new.layout
+                                || old.method != new.method || old.output != new.output);
+                        let needs_reset = changed_target
+                            && previous.wipe_output(previous.current_mode.into()).is_ok();
+                        let update = core.save_settings(next)?;
+                        if needs_reset {
+                            core.deploy_manager().reset_pending()?;
+                            core.deploy_manager().save()?;
+                        }
+                        Ok(Message::SettingsSaved(update))
+                    });
+                }
+                Message::SettingsSaved(update) => {
+                    self.busy.set(false);
+                    self.temp_settings = self.core.settings().clone();
+                    settings::CONFIG.write().clear();
+                    self.toasts.add({
+                        let mut toast = Toast::success("Settings_Saved".localize());
+                        toast.set_duration(Some(Duration::new(2, 0)));
+                        toast
+                    });
+                    if update.reset_package {
+                        self.package_builder.borrow_mut().reset(self.platform());
+                    }
+                    if update.refresh_mods {
+                        self.do_update(Message::ClearSelect);
+                        self.do_update(Message::ResetMods(None));
+                    }
                 }
                 Message::HandleSettings => {
                     self.temp_settings = self.core.settings().clone();

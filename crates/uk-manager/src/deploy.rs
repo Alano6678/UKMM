@@ -373,7 +373,7 @@ impl Manager {
                     }
                 }
                 None => {
-                    table.remove(canon.as_str());
+                    uk_content::util::remove_rstb_resource(&mut table, canon.as_str());
                 }
             }
         }

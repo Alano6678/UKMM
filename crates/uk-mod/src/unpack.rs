@@ -1,5 +1,6 @@
 mod de;
 use std::{
+    cell::RefCell,
     collections::BTreeSet,
     io::{BufReader, Read, Write},
     ops::Deref,
@@ -19,7 +20,6 @@ use jwalk::WalkDir;
 use lenient_semver::Version;
 use mmap_rs::{Mmap, MmapOptions};
 use ouroboros::self_referencing;
-use parking_lot::Mutex;
 use path_slash::PathExt;
 use rayon::prelude::*;
 use roead::{
@@ -152,11 +152,11 @@ impl ParallelZipReader {
     }
 }
 
-#[inline]
-pub fn init_decompressor() -> Arc<Mutex<zstd::bulk::Decompressor<'static>>> {
-    Arc::new(Mutex::new(
-        zstd::bulk::Decompressor::with_dictionary(super::DICTIONARY).unwrap(),
-    ))
+thread_local! {
+    // All UKMM ZIP resources use the same dictionary. Parallel jobs should not
+    // serialize behind a single mod-wide decompressor lock.
+    static THREAD_DECOMPRESSOR: RefCell<zstd::bulk::Decompressor<'static>> =
+        RefCell::new(zstd::bulk::Decompressor::with_dictionary(super::DICTIONARY).unwrap());
 }
 
 #[derive(Clone, Serialize)]
@@ -165,8 +165,6 @@ pub struct ModReader {
     options: Vec<ModOption>,
     pub meta: Meta,
     pub manifest: Manifest,
-    #[serde(skip, default = "init_decompressor")]
-    decompressor: Arc<Mutex<zstd::bulk::Decompressor<'static>>>,
     #[serde(skip_serializing)]
     zip: Arc<Option<ParallelZipReader>>,
     #[serde(skip)]
@@ -180,7 +178,6 @@ impl std::fmt::Debug for ModReader {
             .field("options", &self.options)
             .field("meta", &self.meta)
             .field("manifest", &self.manifest)
-            .field("decompressor", &"zstd::bulk::Decompressor<'static>")
             .field("zip", &self.zip)
             .field("native", &self.memory.is_some())
             .finish()
@@ -257,11 +254,13 @@ impl ModReader {
 
     #[inline]
     fn decompress(&self, data: &[u8]) -> Result<Vec<u8>> {
-        let mut decomp = self.decompressor.lock();
-        let size = zstd::bulk::Decompressor::upper_bound(data).unwrap_or(data.len() * 1024);
-        decomp
-            .decompress(data, size)
-            .or_else(|e| zstd::decode_all(data).context(e))
+        THREAD_DECOMPRESSOR.with(|decomp| {
+            let size = zstd::bulk::Decompressor::upper_bound(data).unwrap_or(data.len() * 1024);
+            decomp
+                .borrow_mut()
+                .decompress(data, size)
+                .or_else(|e| zstd::decode_all(data).context(e))
+        })
     }
 
     fn open_inner(path: &Path, options: Vec<ModOption>, peek: bool) -> Result<Self> {
@@ -317,7 +316,6 @@ impl ModReader {
         }
         Ok(Self {
             path,
-            decompressor: init_decompressor(),
             options,
             meta,
             manifest,
@@ -380,7 +378,6 @@ impl ModReader {
         }
         Ok(Self {
             path,
-            decompressor: init_decompressor(),
             options,
             meta,
             manifest,
@@ -413,7 +410,6 @@ impl ModReader {
             meta: memory.meta.clone(),
             path,
             options,
-            decompressor: init_decompressor(),
             zip: Arc::new(None),
             memory: Some(memory),
         })
@@ -474,6 +470,11 @@ impl ModReader {
     }
 
     pub fn get_resources(&self, name: &Path) -> Result<Vec<ResourceData>> {
+        self.get_shared_resources(name)
+            .map(|resources| resources.into_iter().map(|r| r.as_ref().clone()).collect())
+    }
+
+    pub fn get_shared_resources(&self, name: &Path) -> Result<Vec<Arc<ResourceData>>> {
         if let Some(memory) = &self.memory {
             let canon = canonicalize(name);
             let mut versions = Vec::new();
@@ -504,13 +505,15 @@ impl ModReader {
         self.get_versions(name)?
             .into_iter()
             .map(|data| {
-                minicbor_ser::from_slice(&data).with_context(|| {
-                    format!(
-                        "Failed to deserialize {} from mod {}",
-                        name.display(),
-                        self.meta.name
-                    )
-                })
+                minicbor_ser::from_slice(&data)
+                    .map(Arc::new)
+                    .with_context(|| {
+                        format!(
+                            "Failed to deserialize {} from mod {}",
+                            name.display(),
+                            self.meta.name
+                        )
+                    })
             })
             .collect()
     }
@@ -707,14 +710,38 @@ impl ModUnpacker {
         })?;
         // Preserve BNP removals and declared memory floors after estimating the
         // final resources. A declared size must not reduce an automatic estimate.
+        let hash_name = |name: &str| roead::aamp::Name::from(name).hash();
+        let mut names_by_hash: HashMap<u32, Vec<String>> = Default::default();
+        for entry in self.rstb.iter() {
+            names_by_hash.entry(hash_name(entry.key().as_str())).or_default()
+                .push(entry.key().clone());
+        }
         for mod_ in &self.mods {
+            // RSTB stores CRC keys. Ported BNPs can declare synthetic names
+            // with the same CRC as the real resource, so combine same-mod
+            // floors before applying later mods' removals or replacements.
+            let mut grouped: std::collections::BTreeMap<u32, (String, u32)> = Default::default();
             for (canon, size) in mod_.rstb_overrides() {
+                let entry = grouped.entry(hash_name(canon.as_str())).or_insert((canon.clone(), size));
                 if size == 0 {
-                    self.rstb.insert(canon, None);
-                } else {
-                    let mut value = self.rstb.entry(canon).or_insert(Some(size));
-                    *value = Some(value.unwrap_or_default().max(size));
+                    if entry.1 != 0 || canon < entry.0 { entry.0 = canon; }
+                    entry.1 = 0;
+                } else if entry.1 != 0 {
+                    entry.1 = entry.1.max(size);
+                    if canon < entry.0 { entry.0 = canon; }
                 }
+            }
+            for (hash, (canon, size)) in grouped {
+                let names = names_by_hash.entry(hash).or_default();
+                let inherited = names.drain(..).filter_map(|name| {
+                    self.rstb.remove(&name).and_then(|(_, size)| size)
+                }).max().unwrap_or_default();
+                if size == 0 {
+                    self.rstb.insert(canon.clone(), None);
+                } else {
+                    self.rstb.insert(canon.clone(), Some(inherited.max(size)));
+                }
+                names.push(canon);
             }
         }
         Ok(self.rstb)
@@ -799,6 +826,10 @@ impl ModUnpacker {
     }
 
     fn build_file(&self, file: &str, aoc: bool) -> Result<Vec<u8>> {
+        self.build_scoped_file(file, aoc, None)
+    }
+
+    fn build_scoped_file(&self, file: &str, aoc: bool, scope: Option<&str>) -> Result<Vec<u8>> {
         let mut versions = std::collections::VecDeque::with_capacity(
             (self.mods.len() as f32 / 2.).ceil() as usize,
         );
@@ -821,6 +852,56 @@ impl ModUnpacker {
                 .unwrap_or_default(),
         );
         let mut dump_error: Vec<anyhow_ext::Error> = vec![];
+        let mut mod_versions = Vec::new();
+        for mod_ in &self.mods {
+            if !mod_.contains_resource(filepath.as_ref()) {
+                continue;
+            }
+            let resources = mod_
+                .get_shared_resources(filepath.as_ref())
+                .with_context(|| format!("Failed to read {canon} from mod {}", mod_.meta.name))?;
+            mod_versions.extend(resources);
+        }
+        // These formats are opaque replacements, not semantic patches. Reading
+        // and decompressing the vanilla asset cannot affect the selected bytes.
+        const OPAQUE_EXTS: &[&str] = &[
+            "bfres", "bitemico", "bfsha", "bntx", "bflim", "hksc", "hkrb", "hktmrb", "hknm2",
+            "hkrg", "hkcl", "bfevfl", "bfevtm", "bfstm", "bfwav", "bfstp", "jpg", "jpeg", "png",
+        ];
+        let opaque = canon_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|ext| OPAQUE_EXTS.contains(&ext));
+        if opaque
+            && !mod_versions.is_empty()
+            && mod_versions
+                .iter()
+                .all(|resource| resource.as_binary().is_some())
+        {
+            let data = mod_versions.last().unwrap().as_binary().unwrap();
+            if can_rstb {
+                let size = rstb::calc::estimate_from_slice_and_name(data, &filepath, self.endian.into());
+                if canon.ends_with(".bfres") {
+                    // Archive scope selects the bytes; RSTB uses the logical
+                    // resource name. Cover the largest of all scoped copies.
+                    let logical = canon.rsplit("//").next().unwrap_or(&canon);
+                    let key = if aoc && !logical.starts_with("Aoc/0010/") {
+                        format!("Aoc/0010/{logical}")
+                    } else {
+                        logical.to_owned()
+                    };
+                    self.rstb.entry(key.into()).and_modify(|old| {
+                        *old = match (*old, size) {
+                            (Some(a), Some(b)) => Some(a.max(b)),
+                            _ => None,
+                        };
+                    }).or_insert(size);
+                } else {
+                    self.rstb.insert(canon, size);
+                }
+            }
+            return Ok(data.to_vec());
+        }
         let res_result = self.dump.get_data(&filepath);
         match res_result {
             Ok(ref_res) => versions.push_back(ref_res),
@@ -829,15 +910,7 @@ impl ModUnpacker {
                 dump_error.push(e.into());
             }
         }
-        for mod_ in &self.mods {
-            if !mod_.contains_resource(filepath.as_ref()) {
-                continue;
-            }
-            let resources = mod_
-                .get_resources(filepath.as_ref())
-                .with_context(|| format!("Failed to read {canon} from mod {}", mod_.meta.name))?;
-            versions.extend(resources.into_iter().map(Arc::new));
-        }
+        versions.extend(mod_versions);
         let base_version = versions
             .pop_front()
             .with_context(|| {
@@ -903,7 +976,7 @@ impl ModUnpacker {
                         res
                     });
                 let data = self
-                    .build_sarc(merged, aoc)
+                    .build_sarc(merged, aoc, scope.unwrap_or(&filepath))
                     .with_context(|| jstr!("Failed to build SARC file {&file}"))?;
                 if can_rstb {
                     rstb_val = Some(rstb::calc::calc_from_size_and_name(
@@ -921,15 +994,23 @@ impl ModUnpacker {
         Ok(data)
     }
 
-    fn build_sarc(&self, sarc: SarcMap, aoc: bool) -> Result<Vec<u8>> {
+    fn build_sarc(&self, sarc: SarcMap, aoc: bool, scope: &str) -> Result<Vec<u8>> {
         let mut writer = SarcWriter::new(self.endian.into()).with_min_alignment(sarc.alignment);
         for file in sarc.files.into_iter() {
+            let nested = format!("{scope}//{file}");
+            let lookup = if canonicalize(file.as_str()).ends_with(".bfres")
+                && self.mods.iter().any(|m| m.contains_resource(Path::new(&nested)))
+            {
+                nested.as_str()
+            } else {
+                file.as_str()
+            };
             let data = self
-                .build_file(&file, aoc)
+                .build_scoped_file(lookup, aoc, Some(&nested))
                 .with_context(|| jstr!("Failed to build file {&file} for SARC"))?;
             writer.add_file(
                 file.as_str(),
-                compress_if(data.as_ref(), file.as_str()).as_ref(),
+                compress_if(data.as_slice(), file.as_str()).as_ref(),
             );
         }
         Ok(writer.to_binary())

@@ -184,9 +184,13 @@ pub struct AIProgram {
     pub behaviors: BTreeMap<usize, AIEntry>,
     pub queries:   BTreeMap<usize, AIEntry>,
     pub roots:     IndexMap<String, AIEntry>,
+    /// Custom top-level parameters outside the indexed AI graph.
+    #[serde(default)]
+    pub extra: ParameterList,
 }
 
 struct Parser<'a> {
+    root: &'a ParameterList,
     demos: &'a ParameterObject,
     ais: &'a ParameterList,
     action_offset: usize,
@@ -224,6 +228,7 @@ impl<'a> Parser<'a> {
             Box::from(None),
         ))?;
         Ok(Self {
+            root: &pio.param_root,
             demos,
             ais,
             action_offset,
@@ -442,6 +447,14 @@ impl<'a> Parser<'a> {
             behaviors,
             queries,
             roots,
+            extra: ParameterList {
+                objects: self.root.objects.iter()
+                    .filter(|(name, _)| **name != Name::from("DemoAIActionIdx"))
+                    .map(|(name, object)| (*name, object.clone())).collect(),
+                lists: self.root.lists.iter()
+                    .filter(|(name, _)| ![Name::from("AI"), Name::from("Action"), Name::from("Behavior"), Name::from("Query")].contains(*name))
+                    .map(|(name, list)| (*name, list.clone())).collect(),
+            },
         })
     }
 }
@@ -601,6 +614,7 @@ impl Writer {
             demos,
             queries,
             roots,
+            extra,
         } = std::mem::take(&mut self.aiprog);
         for behavior in behaviors.into_values() {
             self.entry_to_list(behavior);
@@ -624,7 +638,7 @@ impl Writer {
             queries,
             ..
         } = self;
-        ParameterIO::new()
+        let mut pio = ParameterIO::new()
             .with_object("DemoAIActionIdx", demos)
             .with_list("AI", ParameterList {
                 lists: ais,
@@ -641,13 +655,17 @@ impl Writer {
             .with_list("Query", ParameterList {
                 lists: queries,
                 ..Default::default()
-            })
+            });
+        pio.param_root.objects.0.extend(extra.objects.0);
+        pio.param_root.lists.0.extend(extra.lists.0);
+        pio
     }
 }
 
 impl Mergeable for AIProgram {
     fn diff(&self, other: &Self) -> Self {
         AIProgram {
+            extra: util::diff_plist(&self.extra, &other.extra),
             demos:     other
                 .demos
                 .iter()
@@ -692,6 +710,7 @@ impl Mergeable for AIProgram {
 
     fn merge(&self, diff: &Self) -> Self {
         Self {
+            extra: util::merge_plist(&self.extra, &diff.extra),
             demos:     {
                 let all_keys: HashSet<_> = self.demos.keys().chain(diff.demos.keys()).collect();
                 all_keys

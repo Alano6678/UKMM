@@ -11,6 +11,12 @@ use roead::{
     types::FixedSafeString,
 };
 
+/// Remove both hash and named entries so a duplicate cannot restore a disabled resource.
+pub fn remove_rstb_resource(table: &mut rstb::ResourceSizeTable, name: &str) {
+    table.remove(name);
+    table.name_map.retain(|key, _| key.as_str() != name);
+}
+
 pub fn diff_plist<P: ParameterListing + From<ParameterList>>(base: &P, other: &P) -> P {
     ParameterList {
         lists: other

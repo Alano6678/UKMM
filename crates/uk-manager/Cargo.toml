@@ -6,6 +6,9 @@ version.workspace = true
 
 [dependencies]
 base64 = "0.22"
+sha2 = "0.10"
+minicbor-ser = { workspace = true }
+zstd = { workspace = true }
 anyhow = { workspace = true }
 anyhow_ext = { workspace = true }
 dashmap = { workspace = true, features = ["rayon"] }

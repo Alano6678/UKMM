@@ -4913,7 +4913,6 @@ checksum = "3582f63211428f83597b51b2ddb88e2a91a9d52d12831f9d08f5e624e8977422"
 [[package]]
 name = "roead"
 version = "1.0.0"
-source = "git+https://github.com/GingerAvalanche/roead.git#5caec3ee345107d2a6ccbd7f33f13cfdbd79fef6"
 dependencies = [
  "almost",
  "base64 0.22.1",
@@ -4985,7 +4984,7 @@ dependencies = [
  "dirs2",
  "include-flate",
  "phf",
- "roead 1.0.0 (git+https://github.com/GingerAvalanche/roead.git)",
+ "roead 1.0.0",
  "ryml",
  "serde",
  "serde_json",
@@ -6058,7 +6057,7 @@ dependencies = [
  "log",
  "minicbor-ser",
  "msyt",
- "roead 1.0.0 (git+https://github.com/GingerAvalanche/roead.git)",
+ "roead 1.0.0",
  "rstb",
  "rustc-hash",
  "serde",
@@ -6105,11 +6104,12 @@ dependencies = [
  "jwalk",
  "lenient_semver",
  "log",
+ "minicbor-ser",
  "parking_lot",
  "path-slash",
  "rayon",
  "remove_dir_all",
- "roead 1.0.0 (git+https://github.com/GingerAvalanche/roead.git)",
+ "roead 1.0.0",
  "rstb",
  "rustc-hash",
  "sanitise-file-name",
@@ -6118,6 +6118,7 @@ dependencies = [
  "serde_with",
  "serde_yaml 0.9.34+deprecated",
  "sevenz-rust",
+ "sha2",
  "smartstring",
  "tempfile",
  "uk-content",
@@ -6127,6 +6128,7 @@ dependencies = [
  "uk-util",
  "unrar",
  "zip",
+ "zstd",
 ]
 
 [[package]]
@@ -6153,7 +6155,7 @@ dependencies = [
  "path-slash",
  "piz",
  "rayon",
- "roead 1.0.0 (git+https://github.com/GingerAvalanche/roead.git)",
+ "roead 1.0.0",
  "rstb",
  "sanitise-file-name",
  "serde",
@@ -6185,7 +6187,7 @@ dependencies = [
  "minicbor-ser",
  "moka",
  "parking_lot",
- "roead 1.0.0 (git+https://github.com/GingerAvalanche/roead.git)",
+ "roead 1.0.0",
  "serde",
  "serde_json",
  "smartstring",
@@ -6257,6 +6259,7 @@ dependencies = [
  "smartstring",
  "ssilide",
  "strfmt",
+ "tempfile",
  "uk-content",
  "uk-localization",
  "uk-manager",

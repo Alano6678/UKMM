@@ -79,7 +79,34 @@ impl Mod {
 
     pub fn manifest_with_options(&self, options: impl AsRef<[ModOption]>) -> Result<Arc<Manifest>> {
         if uk_mod::native::is_bnp(&self.path) {
-            // BNP resource paths depend on the current dump and language.
+            // UI manifest queries must not repeatedly load large BNP resources
+            // when more mods are installed than the decoded memory cache holds.
+            // Reader registration changes the generation after settings reload.
+            type NativeManifestKey = (u64, PathBuf, u64, std::time::SystemTime, Vec<PathBuf>);
+            static NATIVE_MANIFESTS: LazyLock<RwLock<HashMap<NativeManifestKey, Arc<Manifest>>>> =
+                LazyLock::new(|| RwLock::new(HashMap::default()));
+            if self.path.is_file() {
+                let metadata = fs::metadata(&self.path)?;
+                let generation = uk_mod::native::generation();
+                let key = (
+                    generation,
+                    self.path.clone(),
+                    metadata.len(),
+                    metadata.modified()?,
+                    options.as_ref().iter().map(|o| o.path.clone()).collect(),
+                );
+                if let Some(manifest) = NATIVE_MANIFESTS.read().get(&key) {
+                    return Ok(manifest.clone());
+                }
+                let manifest = Arc::new(ModReader::open(&self.path, options.as_ref())?.manifest);
+                let mut cache = NATIVE_MANIFESTS.write();
+                cache.retain(|(epoch, ..), _| *epoch == generation);
+                if cache.len() >= 512 {
+                    cache.clear();
+                }
+                cache.insert(key, manifest.clone());
+                return Ok(manifest);
+            }
             return ModReader::open(&self.path, options.as_ref()).map(|r| Arc::new(r.manifest));
         }
         static MANIFEST_CACHE: ManifestCache = LazyLock::new(|| RwLock::new(HashMap::default()));

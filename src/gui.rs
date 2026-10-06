@@ -196,6 +196,7 @@ pub enum Message {
     ResetSettings,
     Restart,
     SaveSettings,
+    SettingsSaved(uk_manager::core::SettingsUpdate),
     SelectAlso(usize),
     SelectFile,
     SelectOnly(usize),
@@ -440,8 +441,10 @@ impl App {
                     ).context(std::backtrace::Backtrace::force_capture()))
                 }
             };
-            if let Some(d) = core.settings().dump() {
-                d.clear_cache()
+            if !matches!(&response, Message::SettingsSaved(_)) {
+                if let Some(d) = core.settings().dump() {
+                    d.clear_cache()
+                }
             }
             sender.send(response).unwrap();
         });

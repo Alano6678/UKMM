@@ -10,7 +10,7 @@ use anyhow::Result;
 use parking_lot::RwLock;
 use rustc_hash::FxHashMap;
 use serde::Deserialize;
-use uk_content::{constants::Language, prelude::Endian};
+use uk_content::constants::Language;
 use uk_localization::LocLang;
 use uk_manager::{settings::{DeployConfig, Platform, PlatformSettings}};
 use uk_reader::ResourceReader;
@@ -20,7 +20,6 @@ use uk_ui::{
     icons::{self, IconButtonExt},
     visuals::Theme,
 };
-use uk_util::OptionResultExt;
 
 use super::{App, Message};
 
@@ -61,10 +60,16 @@ pub enum DumpType {
 }
 
 impl DumpType {
-    pub fn host_path(&self) -> &Path {
-        match self {
-            DumpType::Unpacked { host_path, .. } => host_path.as_path(),
-            DumpType::ZArchive { host_path, .. } => host_path.as_path(),
+    fn same_source(&self, other: &Self) -> bool {
+        fn path(value: &Option<PathBuf>) -> Option<&Path> {
+            value.as_deref().filter(|p| !p.as_os_str().is_empty())
+        }
+        match (self, other) {
+            (Self::Unpacked { content_dir: a, update_dir: b, aoc_dir: c, .. },
+             Self::Unpacked { content_dir: x, update_dir: y, aoc_dir: z, .. }) =>
+                path(a) == path(x) && path(b) == path(y) && path(c) == path(z),
+            (Self::ZArchive { host_path: a, .. }, Self::ZArchive { host_path: b, .. }) => a == b,
+            _ => false,
         }
     }
 
@@ -124,50 +129,51 @@ impl Default for PlatformSettingsUI {
     }
 }
 
-impl TryFrom<PlatformSettingsUI> for PlatformSettings {
-    type Error = anyhow::Error;
+impl PlatformSettingsUI {
+    fn deployment(&self) -> Option<DeployConfig> {
+        if self.deploy_config.output.as_os_str().is_empty() {
+            None
+        } else {
+            let mut config = self.deploy_config.clone();
+            config.executable = config.executable.filter(|value| !value.is_empty());
+            Some(config)
+        }
+    }
 
-    fn try_from(settings: PlatformSettingsUI) -> Result<Self> {
-        let dump = match settings.dump {
-            DumpType::Unpacked {
-                content_dir,
-                update_dir,
-                aoc_dir,
-                ..
-            } => {
-                let endian = content_dir
-                    .as_ref()
-                    .and_then(|p| p.to_string_lossy()
-                        .contains("content")
-                        .then_some(Endian::Big)
-                        .or(Some(Endian::Little))
-                    )
-                    .ok_or_else(||
-                        uk_reader::ROMError::MissingDumpDir(
-                            "Base",
-                            content_dir.clone().unwrap_or_default()
-                        )
-                    )?;
-                Arc::new(ResourceReader::from_unpacked_dirs(
+    pub(super) fn apply(
+        self,
+        previous: Option<&PlatformSettings>,
+        platform: Platform,
+    ) -> Result<PlatformSettings> {
+        let deployment = self.deployment();
+        let retained = previous
+            .filter(|old| self.dump.same_source(&DumpType::from(old.dump.as_ref())))
+            .map(|old| old.dump.clone());
+        let dump = if let Some(reader) = retained {
+            reader
+        } else {
+            match self.dump {
+                DumpType::Unpacked {
                     content_dir,
                     update_dir,
                     aoc_dir,
-                    endian,
-                )?)
-            }
-            DumpType::ZArchive { host_path, .. } => {
-                Arc::new(ResourceReader::from_zarchive(host_path)?)
+                    ..
+                } => Arc::new(ResourceReader::from_unpacked_dirs(
+                    content_dir,
+                    update_dir,
+                    aoc_dir,
+                    platform.into(),
+                )?),
+                DumpType::ZArchive { host_path, .. } => {
+                    Arc::new(ResourceReader::from_zarchive(host_path)?)
+                }
             }
         };
-        Ok(Self {
-            language: settings.language,
-            profile: settings.profile.into(),
+        Ok(PlatformSettings {
+            language: self.language,
+            profile: self.profile.into(),
             dump,
-            deploy_config: if settings.deploy_config.output.as_os_str().is_empty() {
-                None
-            } else {
-                Some(settings.deploy_config)
-            },
+            deploy_config: deployment,
         })
     }
 }
@@ -186,13 +192,92 @@ impl From<&PlatformSettings> for PlatformSettingsUI {
 impl PartialEq<PlatformSettings> for PlatformSettingsUI {
     fn eq(&self, other: &PlatformSettings) -> bool {
         self.language == other.language
-            && other.deploy_config.contains(&self.deploy_config)
-            && self.dump.host_path() == other.dump.source().host_path()
+            && self.profile == other.profile.as_str()
+            && PlatformSettingsUI::from(other).deployment() == self.deployment()
+            && self.dump.same_source(&DumpType::from(other.dump.as_ref()))
     }
 }
 
 pub static CONFIG: LazyLock<RwLock<FxHashMap<Platform, PlatformSettingsUI>>> =
     LazyLock::new(|| RwLock::new(Default::default()));
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn settings_form_deploy_change_reuses_dump_and_fast_save() {
+        let temp = tempfile::tempdir().unwrap();
+        let dump_dir = temp.path().join("content");
+        std::fs::create_dir_all(dump_dir.join("Model")).unwrap();
+        std::fs::write(dump_dir.join("Model/Armor_001.sbfres"), [1, 2, 3, 4]).unwrap();
+        let dump = Arc::new(ResourceReader::from_unpacked_mod(temp.path()).unwrap());
+        let resource = dump.get_data("Model/Armor_001.bfres").unwrap();
+        let config = PlatformSettings {
+            language: Language::USen,
+            profile: "Default".into(),
+            dump: dump.clone(),
+            deploy_config: Some(DeployConfig {
+                output: temp.path().join("output"),
+                ..Default::default()
+            }),
+        };
+        let mut form = PlatformSettingsUI::from(&config);
+        if let DumpType::Unpacked { update_dir, aoc_dir, .. } = &mut form.dump {
+            update_dir.get_or_insert_default();
+            aoc_dir.get_or_insert_default();
+        }
+        form.deploy_config.executable.get_or_insert_default();
+        assert!(form.eq(&config));
+        form.deploy_config.auto = true;
+        assert!(form.ne(&config));
+        let applied = form.apply(Some(&config), Platform::WiiU).unwrap();
+        assert!(Arc::ptr_eq(&dump, &applied.dump));
+        let core = uk_manager::core::Manager::from_settings(uk_manager::settings::Settings {
+            storage_dir: temp.path().join("storage"),
+            wiiu_config: Some(config),
+            ..Default::default()
+        }).unwrap();
+        let mut settings = core.settings().clone();
+        settings.wiiu_config = Some(applied);
+        let update = core.save_settings_to(settings, &temp.path().join("settings.yml")).unwrap();
+        assert!(!update.refresh_mods && !update.reset_package);
+        assert!(Arc::ptr_eq(&resource, &dump.get_data("Model/Armor_001.bfres").unwrap()));
+    }
+
+    #[test]
+    fn settings_form_detects_dump_subdirectories_and_profile_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("first");
+        let second = temp.path().join("second");
+        for path in [&first, &second] {
+            std::fs::create_dir_all(path.join("Map/MainField/A-1")).unwrap();
+            std::fs::write(path.join("Map/MainField/A-1/A-1.00_Clustering.sblwp"), [0]).unwrap();
+        }
+        let config = PlatformSettings {
+            language: Language::USen,
+            profile: "Default".into(),
+            dump: Arc::new(ResourceReader::from_unpacked_dirs(
+                Some(&first), None::<&std::path::Path>, None::<&std::path::Path>,
+                uk_content::prelude::Endian::Little).unwrap()),
+            deploy_config: None,
+        };
+        let mut form = PlatformSettingsUI::from(&config);
+        assert!(form.eq(&config));
+        form.profile = "Alternate".into();
+        assert!(form.ne(&config));
+        form.profile = "Default".into();
+        // Keep the same host path while changing one actual dump directory.
+        if let DumpType::Unpacked { content_dir, .. } = &mut form.dump {
+            *content_dir = Some(second.clone());
+        }
+        assert!(form.ne(&config));
+        let applied = form.apply(Some(&config), Platform::Switch).unwrap();
+        assert!(!Arc::ptr_eq(&config.dump, &applied.dump));
+        let source = DumpType::from(applied.dump.as_ref());
+        assert!(matches!(source, DumpType::Unpacked { content_dir: Some(ref path), .. } if path == &second));
+    }
+}
 
 fn render_deploy_config(config: &mut DeployConfig, platform: Platform, ui: &mut Ui) -> bool {
     ui.label("Settings_Platform_Deploy".localize());
@@ -681,36 +766,8 @@ impl App {
                             || switch_changed;
                     ui.add_enabled_ui(platform_config_changed, |ui| {
                         if ui.button("Generic_Save".localize()).clicked() {
-                            if wiiu_changed {
-                                let wiiu_config_ui =
-                                    CONFIG.write().get(&Platform::WiiU).unwrap().clone();
-                                let wiiu_config = wiiu_config_ui.try_into();
-                                match wiiu_config {
-                                    Ok(conf) => {
-                                        CONFIG.write().remove(&Platform::WiiU);
-                                        self.temp_settings.wiiu_config = Some(conf)
-                                    }
-                                    Err(e) => {
-                                        self.do_update(Message::Error(e));
-                                        return;
-                                    }
-                                }
-                            }
-                            if switch_changed {
-                                let switch_config_ui =
-                                    CONFIG.write().get(&Platform::Switch).unwrap().clone();
-                                let switch_config = switch_config_ui.try_into();
-                                match switch_config {
-                                    Ok(conf) => {
-                                        CONFIG.write().remove(&Platform::Switch);
-                                        self.temp_settings.switch_config = Some(conf)
-                                    }
-                                    Err(e) => {
-                                        self.do_update(Message::Error(e));
-                                        return;
-                                    }
-                                }
-                            }
+                            // Snapshot and convert edited platform forms in the
+                            // background save task, not in the render callback.
                             self.do_update(Message::SaveSettings);
                         }
                         if ui.button("Generic_Reset".localize()).clicked() {
